@@ -1,7 +1,7 @@
-// SWERVE — Core game loop, canvas renderer, controls, obstacles, and UI state
+// SWERVE — 3D Perspective Lean & Dodge engine, renderer, controls, and UI
 
 import { SoundEngine } from './audio.js';
-import { PoseTracker, UPPER_BODY_CONNECTIONS } from './tracker.js';
+import { PoseTracker, UPPER_BODY_CONNECTIONS, ALIGN_BOUNDS } from './tracker.js';
 
 const STORAGE_KEYS = {
   highScore: 'swerve_high_score',
@@ -20,17 +20,27 @@ const COLORS = {
   bg: '#0c0e10',
   stage: '#121518',
   volt: '#c8f53b',
-  voltSoft: 'rgba(200, 245, 59, 0.25)',
   vermilion: '#ff4d2e',
-  vermilionSoft: 'rgba(255, 77, 46, 0.24)',
+  vermilionSide: '#9e2613',
+  vermilionDeep: '#6e190c',
   amber: '#ffb82e',
-  amberSoft: 'rgba(255, 184, 46, 0.28)',
   white: '#f2f5f7',
-  muted: 'rgba(255, 255, 255, 0.2)',
 };
+
+// 3D Corridor Perspective Constants
+const FOCAL_LENGTH = 0.29;
+const SPAWN_Z = 1.05;
+const DESPAWN_Z = -0.22;
+const PLAYER_UPRIGHT_WY = -0.14;
+const PLAYER_DUCK_WY = 0.48;
+const LOW_BEAM_BOTTOM_WY = -0.06;
 
 function clamp(v, min, max) {
   return Math.max(min, Math.min(max, v));
+}
+
+function lerp(a, b, t) {
+  return a + (b - a) * t;
 }
 
 function readStorage(key, fallback) {
@@ -149,6 +159,7 @@ class SwerveGame {
     this.combo = 1;
     this.peakCombo = 1;
     this.elapsedRunSec = 0;
+    this.tunnelScroll = 0;
     this.readyTimer = 0;
     this.invulnTimer = 0;
     this.shakeTime = 0;
@@ -156,15 +167,15 @@ class SwerveGame {
     this.damageFlash = 0;
     this.stats = { dodges: 0, closeCalls: 0, rings: 0 };
 
-    // Player core state
+    // Player core state (wx in [-0.84, 0.84], wy moves from upright to ducked)
     this.player = {
-      x: 0.5, // normalized inside playable corridor (0..1)
+      x: 0.5, // normalized 0..1 across playable width
       targetX: 0.5,
       vx: 0,
       isDucked: false,
       wasDucked: false,
       duckStartTime: 0,
-      duckAnim: 0, // 0..1 smooth squash animation
+      duckAnim: 0, // 0..1 smooth vertical crouch
       trail: [],
     };
 
@@ -172,12 +183,12 @@ class SwerveGame {
     this.keys = { left: false, right: false, duck: false };
     this.pointer = { active: false, id: null, x: 0, y: 0, ducking: false };
 
-    // Entities
+    // 3D Entities
     this.obstacles = [];
     this.rings = [];
     this.particles = [];
     this.callouts = [];
-    this.spawnTimer = 0.65;
+    this.spawnTimer = 0.6;
     this.lastPattern = null;
     this.samePatternStreak = 0;
     this.toastTimer = null;
@@ -198,7 +209,6 @@ class SwerveGame {
     window.addEventListener('resize', () => this._resize());
     window.addEventListener('orientationchange', () => setTimeout(() => this._resize(), 120));
 
-    // Auto-pause if user switches apps or tabs mid-run
     document.addEventListener('visibilitychange', () => {
       if (document.hidden && this.state === 'playing') {
         this.openPause('playing');
@@ -448,8 +458,7 @@ class SwerveGame {
     this.pointer.y = clientY;
     const normX = clamp((clientX - this.playLeft) / this.playW, 0.08, 0.92);
     this.player.targetX = normX;
-    // Dragging into the lower ~24% of the screen activates duck
-    this.pointer.ducking = clientY >= this.viewH * 0.74;
+    this.pointer.ducking = clientY >= this.viewH * 0.72;
   }
 
   _resize() {
@@ -461,7 +470,6 @@ class SwerveGame {
     this.canvas.height = Math.floor(this.viewH * this.dpr);
     this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
 
-    // Keep mobile portrait full-bleed while giving desktop a crisp arcade corridor
     this.playW = Math.min(this.viewW, 560);
     this.playLeft = (this.viewW - this.playW) * 0.5;
     this.playRight = this.playLeft + this.playW;
@@ -512,7 +520,8 @@ class SwerveGame {
     this.screenPause.classList.toggle('hidden', name !== 'paused');
     this.screenGameover.classList.toggle('hidden', name !== 'gameover');
 
-    const showHud = name === 'playing' || name === 'ready' || (name === 'paused' && this.pauseReturnState === 'playing');
+    const showHud =
+      name === 'playing' || name === 'ready' || (name === 'paused' && this.pauseReturnState === 'playing');
     this.hudEl.classList.toggle('hidden', !showHud);
     this.btnRecenter.classList.toggle('hidden', this.controlMode !== 'camera');
 
@@ -614,6 +623,7 @@ class SwerveGame {
     this.combo = 1;
     this.peakCombo = 1;
     this.elapsedRunSec = 0;
+    this.tunnelScroll = 0;
     this.readyTimer = 0.6;
     this.invulnTimer = 0;
     this.shakeTime = 0;
@@ -694,37 +704,61 @@ class SwerveGame {
     }
   }
 
+  // ==================== 3D PERSPECTIVE PROJECTION ====================
+
+  _getCorridorCamera() {
+    const nearW = this.playW * 0.94;
+    const nearH = this.viewH * 0.72;
+    const cx = this.viewW * 0.5;
+    const cy = this.viewH * 0.54;
+
+    // Head-coupled 3D parallax: leaning shifts horizon X, ducking drops eye line Y
+    const leanNorm = (this.player.x - 0.5) * 2; // -1..1
+    const vpX = cx - leanNorm * (this.playW * 0.085);
+    const vpY = this.viewH * 0.53 + this.player.duckAnim * (this.viewH * 0.11);
+
+    return { nearW, nearH, cx, cy, vpX, vpY };
+  }
+
+  _project(wx, wy, z, cam = this._getCorridorCamera()) {
+    const s = FOCAL_LENGTH / Math.max(0.065, z + FOCAL_LENGTH);
+    const sx = cam.vpX + (cam.cx - cam.vpX + wx * (cam.nearW * 0.5)) * s;
+    const sy = cam.vpY + (cam.cy - cam.vpY + wy * (cam.nearH * 0.5)) * s;
+    return { x: sx, y: sy, s };
+  }
+
   _getPlayerMetrics() {
-    const r = clamp(this.playW * 0.056, 18, 26);
-    const pad = r + 10;
-    const minX = this.playLeft + pad;
-    const maxX = this.playRight - pad;
-    const px = minX + this.player.x * (maxX - minX);
-    const py = this.viewH * 0.76;
-    return { x: px, y: py, r, hitR: r * 0.86 };
+    const cam = this._getCorridorCamera();
+    const wx = clamp((this.player.x - 0.5) * 1.72, -0.84, 0.84);
+    const wy = lerp(PLAYER_UPRIGHT_WY, PLAYER_DUCK_WY, this.player.duckAnim);
+    const pt = this._project(wx, wy, 0, cam);
+    const floorPt = this._project(wx, 1.0, 0, cam);
+
+    // Compact, nimble studio reticle (~38% smaller than before)
+    const r = clamp(this.playW * 0.032, 11, 15);
+    const hitHalfWx = (r * 0.84) / (cam.nearW * 0.5);
+
+    return { x: pt.x, y: pt.y, floorX: floorPt.x, floorY: floorPt.y, wx, wy, r, hitHalfWx, cam };
   }
 
   _getDifficulty() {
-    // Smooth progression from 0 -> 1 over ~95 seconds of survival
+    // Smooth progression over ~95 seconds of survival
     const t = clamp(this.elapsedRunSec / 95, 0, 1);
-    const speedPxPerSec = this.viewH * (0.44 + t * 0.4);
-    const telegraphSec = 0.64 - t * 0.22;
-    const spawnIntervalSec = 1.48 - t * 0.64;
-    return { t, speedPxPerSec, telegraphSec, spawnIntervalSec };
+    const zSpeed = 0.54 + t * 0.56; // depth units/sec (1.0 -> 0.0 takes ~1.85s ramping to ~0.91s)
+    const telegraphSec = 0.62 - t * 0.2;
+    const spawnIntervalSec = 1.5 - t * 0.64;
+    return { t, zSpeed, telegraphSec, spawnIntervalSec };
   }
 
   _spawnNextWave() {
     const diff = this._getDifficulty();
     const patterns = ['left', 'right', 'center', 'lowBeam'];
 
-    // Weight patterns so Low Beam appears frequently enough to stay exciting without spamming
-    let weights = [1.0, 1.0, 0.95, 0.85];
+    let weights = [1.0, 1.0, 0.95, 0.88];
     if (this.elapsedRunSec < 4.5) {
-      // Friendly intro: start with a clear side wall before introducing beams
-      weights = [1.2, 1.2, 0.7, 0.35];
+      weights = [1.2, 1.2, 0.7, 0.4];
     }
 
-    // Avoid overly repetitive consecutive patterns
     if (this.lastPattern !== null) {
       const lastIdx = patterns.indexOf(this.lastPattern);
       if (this.samePatternStreak >= 2 && lastIdx >= 0) {
@@ -752,7 +786,6 @@ class SwerveGame {
       this.samePatternStreak = 1;
     }
 
-    // Extra breathing room when swapping directly from Left Wall <-> Right Wall
     let extraDelay = 0;
     const prevObs = this.obstacles[this.obstacles.length - 1];
     if (
@@ -762,70 +795,79 @@ class SwerveGame {
       extraDelay = 0.16;
     }
 
-    let xNorm = 0;
-    let wNorm = 1;
-    let height = 34;
+    let wx1 = -1;
+    let wx2 = 1;
+    let wy1 = -1;
+    let wy2 = 1;
+    let depth = 0.1;
 
     if (type === 'left') {
-      xNorm = 0;
-      wNorm = 0.58;
+      wx1 = -1.0;
+      wx2 = 0.14;
     } else if (type === 'right') {
-      wNorm = 0.58;
-      xNorm = 1 - wNorm;
+      wx1 = -0.14;
+      wx2 = 1.0;
     } else if (type === 'center') {
-      wNorm = 0.4;
-      xNorm = 0.5 - wNorm * 0.5;
-      height = 36;
+      wx1 = -0.36;
+      wx2 = 0.36;
+      depth = 0.12;
     } else if (type === 'lowBeam') {
-      xNorm = 0;
-      wNorm = 1;
-      height = 38;
+      wx1 = -1.0;
+      wx2 = 1.0;
+      wy1 = -1.0;
+      wy2 = LOW_BEAM_BOTTOM_WY;
+      depth = 0.12;
     }
 
     const obs = {
       type,
-      xNorm,
-      wNorm,
-      h: height,
-      y: -height,
-      speed: diff.speedPxPerSec,
+      wx1,
+      wx2,
+      wy1,
+      wy2,
+      depth,
+      z: SPAWN_Z,
+      zSpeed: diff.zSpeed,
       state: 'telegraph',
       telegraphTimer: 0,
       telegraphDuration: diff.telegraphSec,
       cleared: false,
       hit: false,
-      minClearance: Infinity,
+      minClearanceWx: Infinity,
       closeDuck: false,
       enteredHitBand: false,
     };
 
     this.obstacles.push(obs);
 
-    // Spawn a collectible Gold Ring in the safe clearance lane ~58% of the time
+    // Collectible 3D Gold Ring in the safe clearance lane (~58% of waves)
     if (Math.random() < 0.58) {
-      let ringNormX = 0.5;
+      let ringWx = 0;
+      let ringWy = PLAYER_UPRIGHT_WY;
       if (type === 'left') {
-        ringNormX = 0.79;
+        ringWx = 0.58;
       } else if (type === 'right') {
-        ringNormX = 0.21;
+        ringWx = -0.58;
       } else if (type === 'center') {
-        ringNormX = Math.random() < 0.5 ? 0.15 : 0.85;
+        ringWx = Math.random() < 0.5 ? -0.68 : 0.68;
       } else if (type === 'lowBeam') {
-        ringNormX = 0.3 + Math.random() * 0.4;
+        ringWx = (Math.random() - 0.5) * 0.7;
+        ringWy = PLAYER_DUCK_WY;
       }
 
       this.rings.push({
-        xNorm: ringNormX,
-        y: -height - 4,
-        speed: diff.speedPxPerSec,
-        delay: diff.telegraphSec + (type === 'lowBeam' ? 0.05 : 0.02),
+        wx: ringWx,
+        wy: ringWy,
+        z: SPAWN_Z,
+        zSpeed: diff.zSpeed,
+        delay: diff.telegraphSec + 0.04,
         active: false,
         collected: false,
         spin: Math.random() * Math.PI * 2,
       });
     }
 
-    this.spawnTimer = diff.spawnIntervalSec + extraDelay + (Math.random() * 0.16 - 0.08);
+    this.spawnTimer = diff.spawnIntervalSec + extraDelay + (Math.random() * 0.15 - 0.075);
   }
 
   _spawnParticles(x, y, color, count = 14, speedScale = 1) {
@@ -837,10 +879,10 @@ class SwerveGame {
         y,
         vx: Math.cos(angle) * speed,
         vy: Math.sin(angle) * speed,
-        size: 3 + Math.random() * 4.5,
+        size: 2.5 + Math.random() * 4,
         color,
-        life: 0.32 + Math.random() * 0.26,
-        maxLife: 0.58,
+        life: 0.32 + Math.random() * 0.25,
+        maxLife: 0.57,
       });
     }
   }
@@ -868,9 +910,13 @@ class SwerveGame {
   }
 
   _update(nowMs, dtSec) {
-    // Always update pose tracker when camera is active (calibrating, ready, playing, paused preview)
     if (this.controlMode === 'camera' && this.tracker.cameraActive) {
       this.poseState = this.tracker.update(nowMs, dtSec, this.viewW, this.viewH);
+    }
+
+    // Gentle tunnel drift on start / ready screens
+    if (this.state === 'start' || this.state === 'ready') {
+      this.tunnelScroll = (this.tunnelScroll + dtSec * 0.35) % 1;
     }
 
     if (this.state === 'calibrating') {
@@ -892,6 +938,8 @@ class SwerveGame {
     }
 
     this.elapsedRunSec += dtSec;
+    const diff = this._getDifficulty();
+    this.tunnelScroll = (this.tunnelScroll + dtSec * diff.zSpeed * 0.72) % 1;
 
     if (this.controlMode === 'practice' && this.elapsedRunSec > 6.5) {
       this.practiceHintEl.style.opacity = '0';
@@ -903,21 +951,21 @@ class SwerveGame {
 
   _updateCalibrationUI() {
     const p = this.poseState;
+    const align = p.alignment || { aligned: false, hint: 'Step into frame · show head & shoulders' };
     const progress = p.calibrationProgress;
     const pct = Math.round(progress * 100);
     const remaining = Math.max(0, 1.4 * (1 - progress));
 
     this.calibrateFill.style.width = `${pct}%`;
-    this.calibrateTimer.textContent = `${remaining.toFixed(1)}s`;
+    this.calibrateTimer.textContent = align.aligned ? `${remaining.toFixed(1)}s` : 'WAIT';
+    this.calibrateLabel.textContent = align.hint;
 
-    if (p.hasPose) {
-      this.calibrateBadge.textContent = 'HOLD NEUTRAL POSTURE';
+    if (align.aligned) {
+      this.calibrateBadge.textContent = 'ALIGNED · HOLD STILL';
       this.calibrateBadge.classList.remove('warn');
-      this.calibrateLabel.textContent = 'Locking neutral center & shoulder span…';
     } else {
-      this.calibrateBadge.textContent = 'STEP INTO FRAME';
+      this.calibrateBadge.textContent = 'ALIGN IN TARGET BOX';
       this.calibrateBadge.classList.add('warn');
-      this.calibrateLabel.textContent = 'Center your head & shoulders in view';
     }
 
     if (p.calibrated && !p.calibrating) {
@@ -932,20 +980,17 @@ class SwerveGame {
       this.poseWarningEl.classList.toggle('hidden', p.hasPose);
 
       if (p.hasPose) {
-        // Map normalized lean [-1, 1] -> [0, 1] across playable corridor
         this.player.targetX = clamp(0.5 + p.lean * 0.5, 0, 1);
         this.player.isDucked = p.isDucked;
       } else {
         this.player.isDucked = false;
       }
 
-      // Snappy frame-rate independent follow on top of tracker EMA
       const alpha = 1 - Math.exp(-dtSec / 0.035);
       const prevX = this.player.x;
       this.player.x += (this.player.targetX - this.player.x) * alpha;
       this.player.vx = (this.player.x - prevX) / Math.max(0.001, dtSec);
     } else {
-      // Practice mode: keyboard + touch/mouse pointer
       const keyDir = (this.keys.right ? 1 : 0) - (this.keys.left ? 1 : 0);
       if (keyDir !== 0) {
         this.player.targetX = clamp(this.player.targetX + keyDir * dtSec * 1.45, 0, 1);
@@ -959,21 +1004,18 @@ class SwerveGame {
       this.player.isDucked = Boolean(this.keys.duck || this.pointer.ducking);
     }
 
-    // Detect fresh duck transition for audio + timing bonus
     if (this.player.isDucked && !this.player.wasDucked) {
       this.player.duckStartTime = nowMs;
       this.audio.duck();
     }
     this.player.wasDucked = this.player.isDucked;
 
-    // Smooth duck squash animation
     const duckTarget = this.player.isDucked ? 1 : 0;
     this.player.duckAnim += (duckTarget - this.player.duckAnim) * (1 - Math.exp(-dtSec / 0.055));
 
-    // Motion trail points
     const pm = this._getPlayerMetrics();
     this.player.trail.unshift({ x: pm.x, y: pm.y, duck: this.player.duckAnim });
-    if (this.player.trail.length > 9) {
+    if (this.player.trail.length > 7) {
       this.player.trail.pop();
     }
   }
@@ -989,16 +1031,15 @@ class SwerveGame {
       this.damageFlash = Math.max(0, this.damageFlash - dtSec * 1.8);
     }
 
-    // Spawn cadence
     this.spawnTimer -= dtSec;
     if (this.spawnTimer <= 0) {
       this._spawnNextWave();
     }
 
     const pm = this._getPlayerMetrics();
-    const nearMissThreshold = Math.max(24, this.playW * 0.075);
+    const nearMissThresholdWx = 0.2;
 
-    // Update obstacles
+    // Update 3D obstacles
     for (let i = this.obstacles.length - 1; i >= 0; i--) {
       const obs = this.obstacles[i];
 
@@ -1006,25 +1047,23 @@ class SwerveGame {
         obs.telegraphTimer += dtSec;
         if (obs.telegraphTimer >= obs.telegraphDuration) {
           obs.state = 'active';
-          obs.y = -obs.h;
+          obs.z = SPAWN_Z;
         }
         continue;
       }
 
-      obs.y += obs.speed * dtSec;
+      obs.z -= obs.zSpeed * dtSec;
+      const zFront = obs.z;
+      const zBack = obs.z + obs.depth;
 
-      const ox = this.playLeft + obs.xNorm * this.playW;
-      const ow = obs.wNorm * this.playW;
-      const oTop = obs.y;
-      const oBottom = obs.y + obs.h;
+      // Player sits at z = 0 plane
+      const overlapsZ = zFront <= 0.025 && zBack >= -0.025;
 
-      const overlapsY = oBottom >= pm.y - pm.hitR && oTop <= pm.y + pm.hitR;
-
-      if (overlapsY && !obs.hit) {
+      if (overlapsZ && !obs.hit) {
         if (obs.type === 'lowBeam') {
           if (!obs.enteredHitBand) {
             obs.enteredHitBand = true;
-            if (this.player.isDucked && nowMs - this.player.duckStartTime <= 280) {
+            if (this.player.isDucked && nowMs - this.player.duckStartTime <= 300) {
               obs.closeDuck = true;
             }
           }
@@ -1032,29 +1071,29 @@ class SwerveGame {
             this._handlePlayerHit(obs, pm);
           }
         } else {
-          const overlapsX = pm.x + pm.hitR > ox && pm.x - pm.hitR < ox + ow;
+          const overlapsX = pm.wx + pm.hitHalfWx > obs.wx1 && pm.wx - pm.hitHalfWx < obs.wx2;
           if (overlapsX) {
             this._handlePlayerHit(obs, pm);
           } else {
-            const distLeft = ox - (pm.x + pm.hitR);
-            const distRight = pm.x - pm.hitR - (ox + ow);
+            const distLeft = obs.wx1 - (pm.wx + pm.hitHalfWx);
+            const distRight = pm.wx - pm.hitHalfWx - obs.wx2;
             const clearance = Math.max(distLeft, distRight);
-            if (clearance < obs.minClearance) {
-              obs.minClearance = clearance;
+            if (clearance < obs.minClearanceWx) {
+              obs.minClearanceWx = clearance;
             }
           }
         }
       }
 
-      // Check clean pass past player core
-      if (!obs.cleared && !obs.hit && oTop > pm.y + pm.hitR) {
+      // Passed cleanly behind player plane
+      if (!obs.cleared && !obs.hit && zBack < -0.025) {
         obs.cleared = true;
         this.stats.dodges += 1;
         this.combo = Math.min(this.combo + 1, 12);
         if (this.combo > this.peakCombo) this.peakCombo = this.combo;
 
         const isNearMiss =
-          (obs.type !== 'lowBeam' && obs.minClearance <= nearMissThreshold) ||
+          (obs.type !== 'lowBeam' && obs.minClearanceWx <= nearMissThresholdWx) ||
           (obs.type === 'lowBeam' && obs.closeDuck);
 
         if (isNearMiss) {
@@ -1062,57 +1101,58 @@ class SwerveGame {
           this.score += pts;
           this.stats.closeCalls += 1;
           this.audio.closeCall(this.combo);
-          this._spawnParticles(pm.x, pm.y - 10, COLORS.amber, 12, 0.9);
-          this._addCallout(pm.x, pm.y - 42, `CLOSE! +${pts}`, COLORS.amber, 17);
+          this._spawnParticles(pm.x, pm.y - 8, COLORS.amber, 12, 0.9);
+          this._addCallout(pm.x, pm.y - 34, `CLOSE! +${pts}`, COLORS.amber, 17);
         } else {
           const pts = 20 * this.combo;
           this.score += pts;
           this.audio.dodge(this.combo);
-          this._addCallout(pm.x, pm.y - 34, `+${pts}`, COLORS.volt, 14);
+          this._addCallout(pm.x, pm.y - 28, `+${pts}`, COLORS.volt, 14);
         }
 
         this._syncScoreHUD();
         this._syncComboHUD();
       }
 
-      if (obs.y > this.viewH + 60) {
+      if (zBack < DESPAWN_Z) {
         this.obstacles.splice(i, 1);
       }
     }
 
-    // Update collectible Gold Rings
-    const ringR = clamp(this.playW * 0.044, 15, 21);
+    // Update 3D collectible Gold Rings
     for (let i = this.rings.length - 1; i >= 0; i--) {
       const ring = this.rings[i];
       if (!ring.active) {
         ring.delay -= dtSec;
         if (ring.delay <= 0) {
           ring.active = true;
-          ring.y = -ringR * 2;
+          ring.z = SPAWN_Z;
         }
         continue;
       }
 
-      ring.y += ring.speed * dtSec;
-      ring.spin += dtSec * 3.8;
+      ring.z -= ring.zSpeed * dtSec;
+      ring.spin += dtSec * 4.2;
 
-      const rx = this.playLeft + ring.xNorm * this.playW;
-      const dist = Math.hypot(rx - pm.x, ring.y - pm.y);
-
-      if (!ring.collected && dist <= ringR + pm.r + 8) {
-        ring.collected = true;
-        const pts = 50 * this.combo;
-        this.score += pts;
-        this.stats.rings += 1;
-        this.audio.goldRing(this.combo);
-        this._spawnParticles(rx, ring.y, COLORS.amber, 16, 1.05);
-        this._addCallout(rx, ring.y - 26, `RING +${pts}`, COLORS.amber, 16);
-        this._syncScoreHUD();
-        this.rings.splice(i, 1);
-        continue;
+      if (!ring.collected && Math.abs(ring.z) <= 0.085) {
+        const dx = Math.abs(ring.wx - pm.wx);
+        const dy = Math.abs(ring.wy - pm.wy);
+        if (dx <= 0.3 && dy <= 0.38) {
+          ring.collected = true;
+          const pts = 50 * this.combo;
+          this.score += pts;
+          this.stats.rings += 1;
+          const rp = this._project(ring.wx, ring.wy, Math.max(0, ring.z), pm.cam);
+          this.audio.goldRing(this.combo);
+          this._spawnParticles(rp.x, rp.y, COLORS.amber, 16, 1.05);
+          this._addCallout(rp.x, rp.y - 24, `RING +${pts}`, COLORS.amber, 16);
+          this._syncScoreHUD();
+          this.rings.splice(i, 1);
+          continue;
+        }
       }
 
-      if (ring.y > this.viewH + 50) {
+      if (ring.z < DESPAWN_Z) {
         this.rings.splice(i, 1);
       }
     }
@@ -1149,13 +1189,13 @@ class SwerveGame {
     this.combo = 1;
     this.invulnTimer = 1.4;
     this.shakeTime = 0.28;
-    this.shakeMag = 13;
+    this.shakeMag = 14;
     this.damageFlash = 0.44;
 
     this._syncShieldsHUD();
     this._syncComboHUD();
     this._spawnParticles(pm.x, pm.y, COLORS.vermilion, 22, 1.3);
-    this._addCallout(pm.x, pm.y - 36, 'SHIELD HIT', COLORS.vermilion, 16);
+    this._addCallout(pm.x, pm.y - 32, 'SHIELD HIT', COLORS.vermilion, 16);
     this.audio.hit();
 
     if (this.shields <= 0) {
@@ -1163,7 +1203,7 @@ class SwerveGame {
     }
   }
 
-  // ==================== RENDERING ====================
+  // ==================== 3D RENDERING ====================
 
   _render(nowMs) {
     const ctx = this.ctx;
@@ -1171,7 +1211,6 @@ class SwerveGame {
 
     ctx.save();
 
-    // Screen shake offset
     if (this.shakeTime > 0) {
       const decay = this.shakeTime / 0.28;
       const sx = (Math.random() * 2 - 1) * this.shakeMag * decay;
@@ -1179,9 +1218,12 @@ class SwerveGame {
       ctx.translate(sx, sy);
     }
 
-    this._drawCorridorGuides(ctx);
+    const cam = this._getCorridorCamera();
 
-    // Upper-body pose skeleton & duck clearance line (camera mode)
+    // 1. 3D Perspective Studio Corridor
+    this._draw3DTunnel(ctx, cam);
+
+    // 2. Subtle Pose Skeleton & Duck Clearance Line (camera mode)
     if (
       this.controlMode === 'camera' &&
       this.tracker.cameraActive &&
@@ -1190,26 +1232,29 @@ class SwerveGame {
       this._drawPoseOverlay(ctx, nowMs);
     }
 
-    // Practice mode duck zone hint while dragging
+    // 3. Practice mode duck zone hint while dragging
     if (this.controlMode === 'practice' && (this.state === 'playing' || this.state === 'ready')) {
       this._drawPracticeDuckZone(ctx);
     }
 
-    // Game entities
-    if (this.state === 'playing' || this.state === 'ready' || this.state === 'paused' || this.state === 'gameover') {
-      this._drawGoldRings(ctx);
-      this._drawObstacles(ctx, nowMs);
+    // 4. 3D Telegraphs, Painter-Sorted Obstacles & Gold Rings, and Compact Player Core
+    if (
+      this.state === 'playing' ||
+      this.state === 'ready' ||
+      this.state === 'paused' ||
+      this.state === 'gameover'
+    ) {
+      this._drawTelegraphs(ctx, cam, nowMs);
+      this._draw3DEntitiesSorted(ctx, cam);
       this._drawPlayerCore(ctx, nowMs);
       this._drawParticles(ctx);
       this._drawCallouts(ctx);
     }
 
-    // Brief GO! banner right after calibration
     if (this.state === 'ready') {
       this._drawReadyBanner(ctx);
     }
 
-    // Damage edge flash
     if (this.damageFlash > 0) {
       ctx.fillStyle = `rgba(255, 77, 46, ${(this.damageFlash * 0.42).toFixed(3)})`;
       ctx.fillRect(0, 0, this.viewW, this.viewH);
@@ -1218,30 +1263,351 @@ class SwerveGame {
     ctx.restore();
   }
 
-  _drawCorridorGuides(ctx) {
-    // Subtle vertical studio rails framing the playable corridor
+  _draw3DTunnel(ctx, cam) {
     ctx.save();
-    ctx.strokeStyle = 'rgba(255, 255, 255, 0.08)';
-    ctx.lineWidth = 1;
 
-    if (this.playLeft > 4) {
+    const farZ = SPAWN_Z;
+    const nearZ = 0;
+
+    // 4 perspective corner rails from distant portal to near plane
+    const corners = [
+      [-1, -1],
+      [1, -1],
+      [1, 1],
+      [-1, 1],
+    ];
+
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.14)';
+    ctx.lineWidth = 1.25;
+    for (const [wx, wy] of corners) {
+      const pFar = this._project(wx, wy, farZ, cam);
+      const pNear = this._project(wx, wy, nearZ, cam);
       ctx.beginPath();
-      ctx.moveTo(this.playLeft, 0);
-      ctx.lineTo(this.playLeft, this.viewH);
-      ctx.moveTo(this.playRight, 0);
-      ctx.lineTo(this.playRight, this.viewH);
+      ctx.moveTo(pFar.x, pFar.y);
+      ctx.lineTo(pNear.x, pNear.y);
       ctx.stroke();
     }
 
-    // Subtle center cadence tick at player horizon
-    const py = this.viewH * 0.76;
-    ctx.strokeStyle = 'rgba(255, 255, 255, 0.06)';
-    ctx.setLineDash([4, 8]);
+    // Subtle floor lane guide lines (left/center/right cues receding into depth)
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.08)';
+    ctx.lineWidth = 1;
+    for (const laneWx of [-0.36, 0.36]) {
+      const pFar = this._project(laneWx, 1, farZ, cam);
+      const pNear = this._project(laneWx, 1, nearZ, cam);
+      ctx.beginPath();
+      ctx.moveTo(pFar.x, pFar.y);
+      ctx.lineTo(pNear.x, pNear.y);
+      ctx.stroke();
+    }
+
+    // Speeding depth portal rings rushing toward camera
+    const frameCount = 5;
+    for (let i = 0; i < frameCount; i++) {
+      let z = ((i / frameCount) - this.tunnelScroll + 1) % 1;
+      z = z * (SPAWN_Z + 0.08) - 0.08;
+      if (z < -0.05 || z > SPAWN_Z) continue;
+
+      const tl = this._project(-1, -1, z, cam);
+      const br = this._project(1, 1, z, cam);
+      const depthAlpha = clamp(1 - z / SPAWN_Z, 0.08, 1) * (z < 0 ? clamp(1 + z * 8, 0, 1) : 1);
+
+      ctx.strokeStyle = `rgba(255, 255, 255, ${(0.05 + depthAlpha * 0.12).toFixed(3)})`;
+      ctx.lineWidth = 1 + depthAlpha * 0.7;
+      ctx.strokeRect(tl.x, tl.y, br.x - tl.x, br.y - tl.y);
+    }
+
+    // Crisp far vanishing portal rectangle
+    const fTL = this._project(-1, -1, farZ, cam);
+    const fBR = this._project(1, 1, farZ, cam);
+    ctx.fillStyle = 'rgba(12, 14, 16, 0.32)';
+    ctx.fillRect(fTL.x, fTL.y, fBR.x - fTL.x, fBR.y - fTL.y);
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.22)';
+    ctx.lineWidth = 1.4;
+    ctx.strokeRect(fTL.x, fTL.y, fBR.x - fTL.x, fBR.y - fTL.y);
+
+    // Subtle near player-plane horizon frame
+    const nTL = this._project(-1, -1, 0, cam);
+    const nBR = this._project(1, 1, 0, cam);
+    ctx.strokeStyle = 'rgba(200, 245, 59, 0.1)';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(nTL.x, nTL.y, nBR.x - nTL.x, nBR.y - nTL.y);
+
+    ctx.restore();
+  }
+
+  _drawTelegraphs(ctx, cam, nowMs) {
+    const hudRect = this.hudEl.getBoundingClientRect();
+    const topBarY = Math.max(12, Math.round(hudRect.bottom) + 4);
+
+    for (const obs of this.obstacles) {
+      if (obs.state !== 'telegraph') continue;
+
+      const progress = clamp(obs.telegraphTimer / obs.telegraphDuration, 0, 1);
+      const pulse = 0.55 + Math.sin(nowMs * 0.026) * 0.35;
+      const isBeam = obs.type === 'lowBeam';
+      const isSafeBeam = isBeam && this.player.isDucked;
+      const accent = isSafeBeam ? COLORS.volt : COLORS.vermilion;
+
+      ctx.save();
+
+      // 1. 3D Distant Portal Preview showing exact upcoming 3D obstacle silhouette
+      const pTL = this._project(obs.wx1, obs.wy1, SPAWN_Z, cam);
+      const pBR = this._project(obs.wx2, obs.wy2, SPAWN_Z, cam);
+      const pw = pBR.x - pTL.x;
+      const ph = pBR.y - pTL.y;
+
+      ctx.fillStyle = isSafeBeam
+        ? `rgba(200, 245, 59, ${(0.18 + progress * 0.28).toFixed(3)})`
+        : `rgba(255, 77, 46, ${(0.22 + progress * 0.36).toFixed(3)})`;
+      ctx.fillRect(pTL.x, pTL.y, pw, ph);
+
+      ctx.strokeStyle = accent;
+      ctx.lineWidth = 2;
+      ctx.globalAlpha = 0.65 + progress * 0.35;
+      ctx.strokeRect(pTL.x, pTL.y, pw, ph);
+
+      // 2. Compact notch-safe top-edge telegraph bar matching obstacle X span
+      const leftNorm = (obs.wx1 + 1) * 0.5;
+      const widthNorm = (obs.wx2 - obs.wx1) * 0.5;
+      const bx = this.playLeft + leftNorm * this.playW + 4;
+      const bw = widthNorm * this.playW - 8;
+
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = isSafeBeam ? 'rgba(200, 245, 59, 0.2)' : 'rgba(255, 77, 46, 0.22)';
+      this._roundRect(ctx, bx, topBarY, bw, 7, 4);
+      ctx.fill();
+
+      const fillW = Math.max(8, bw * progress);
+      ctx.fillStyle = accent;
+      this._roundRect(ctx, bx + (bw - fillW) * 0.5, topBarY, fillW, 7, 4);
+      ctx.fill();
+
+      if (isBeam) {
+        ctx.globalAlpha = pulse;
+        ctx.font = '700 10.5px "JetBrains Mono", monospace';
+        ctx.textAlign = 'center';
+        ctx.fillStyle = accent;
+        ctx.fillText(isSafeBeam ? 'LOW BEAM · CLEAR' : '▼ LOW BEAM · DUCK ▼', bx + bw * 0.5, topBarY + 20);
+        ctx.textAlign = 'left';
+      }
+
+      ctx.restore();
+    }
+  }
+
+  _draw3DEntitiesSorted(ctx, cam) {
+    // Painter's algorithm: collect active obstacles & rings, sort farthest (largest z) to nearest
+    const items = [];
+    for (const obs of this.obstacles) {
+      if (obs.state === 'active') {
+        items.push({ kind: 'obs', z: obs.z, ref: obs });
+      }
+    }
+    for (const ring of this.rings) {
+      if (ring.active && !ring.collected) {
+        items.push({ kind: 'ring', z: ring.z, ref: ring });
+      }
+    }
+
+    items.sort((a, b) => b.z - a.z);
+
+    for (const item of items) {
+      if (item.kind === 'obs') {
+        this._draw3DObstacle(ctx, item.ref, cam);
+      } else {
+        this._draw3DRing(ctx, item.ref, cam);
+      }
+    }
+  }
+
+  _draw3DObstacle(ctx, obs, cam) {
+    const zFront = obs.z;
+    const zBack = obs.z + obs.depth;
+
+    // Fade in smoothly from distant fog and fade out right as it flies past camera
+    const farFade = clamp((SPAWN_Z - zFront) * 4.5 + 0.28, 0.22, 1);
+    const nearFade = zFront < -0.02 ? clamp(1 - (-0.02 - zFront) / 0.16, 0, 1) : 1;
+    const alpha = farFade * nearFade;
+    if (alpha <= 0.01) return;
+
+    const isBeam = obs.type === 'lowBeam';
+    const isBeamCleared = isBeam && this.player.isDucked;
+
+    // Project all 8 corners of the 3D slab
+    const fTL = this._project(obs.wx1, obs.wy1, zFront, cam);
+    const fTR = this._project(obs.wx2, obs.wy1, zFront, cam);
+    const fBR = this._project(obs.wx2, obs.wy2, zFront, cam);
+    const fBL = this._project(obs.wx1, obs.wy2, zFront, cam);
+
+    const bTL = this._project(obs.wx1, obs.wy1, zBack, cam);
+    const bTR = this._project(obs.wx2, obs.wy1, zBack, cam);
+    const bBR = this._project(obs.wx2, obs.wy2, zBack, cam);
+    const bBL = this._project(obs.wx1, obs.wy2, zBack, cam);
+
+    ctx.save();
+    ctx.globalAlpha = alpha;
+
+    // 1. Draw visible 3D extruded side / underside faces first (receding toward vanishing point)
+    const sideFill = isBeamCleared ? 'rgba(130, 180, 32, 0.34)' : COLORS.vermilionSide;
+    const underFill = isBeamCleared ? 'rgba(200, 245, 59, 0.26)' : COLORS.vermilionDeep;
+
+    // Right inner face (visible when obstacle's right edge is left of vanishing point)
+    if (fTR.x < cam.vpX && obs.wx2 < 0.99) {
+      ctx.fillStyle = sideFill;
+      ctx.beginPath();
+      ctx.moveTo(fTR.x, fTR.y);
+      ctx.lineTo(bTR.x, bTR.y);
+      ctx.lineTo(bBR.x, bBR.y);
+      ctx.lineTo(fBR.x, fBR.y);
+      ctx.closePath();
+      ctx.fill();
+      ctx.strokeStyle = isBeamCleared ? 'rgba(200, 245, 59, 0.55)' : 'rgba(255, 165, 145, 0.35)';
+      ctx.lineWidth = 1.2;
+      ctx.stroke();
+    }
+
+    // Left inner face (visible when obstacle's left edge is right of vanishing point)
+    if (fTL.x > cam.vpX && obs.wx1 > -0.99) {
+      ctx.fillStyle = sideFill;
+      ctx.beginPath();
+      ctx.moveTo(fTL.x, fTL.y);
+      ctx.lineTo(bTL.x, bTL.y);
+      ctx.lineTo(bBL.x, bBL.y);
+      ctx.lineTo(fBL.x, fBL.y);
+      ctx.closePath();
+      ctx.fill();
+      ctx.strokeStyle = isBeamCleared ? 'rgba(200, 245, 59, 0.55)' : 'rgba(255, 165, 145, 0.35)';
+      ctx.lineWidth = 1.2;
+      ctx.stroke();
+    }
+
+    // Underside face for overhead Low Beam (visible whenever beam bottom is above eye horizon vpY)
+    if (isBeam && fBL.y < cam.vpY) {
+      ctx.fillStyle = underFill;
+      ctx.beginPath();
+      ctx.moveTo(fBL.x, fBL.y);
+      ctx.lineTo(fBR.x, fBR.y);
+      ctx.lineTo(bBR.x, bBR.y);
+      ctx.lineTo(bBL.x, bBL.y);
+      ctx.closePath();
+      ctx.fill();
+      ctx.strokeStyle = isBeamCleared ? COLORS.volt : 'rgba(255, 165, 145, 0.45)';
+      ctx.lineWidth = 1.4;
+      ctx.stroke();
+    }
+
+    // 2. Draw Front Face
+    const fw = fTR.x - fTL.x;
+    const fh = fBL.y - fTL.y;
+
+    if (isBeamCleared) {
+      // Safe ducked clearance look: crisp translucent volt frame
+      ctx.fillStyle = 'rgba(200, 245, 59, 0.2)';
+      ctx.fillRect(fTL.x, fTL.y, fw, fh);
+      ctx.strokeStyle = COLORS.volt;
+      ctx.lineWidth = Math.max(1.5, 2.8 * fTL.s);
+      ctx.strokeRect(fTL.x, fTL.y, fw, fh);
+    } else {
+      // High-contrast studio vermilion barrier with subtle gradient depth & hazard chevrons
+      const grad = ctx.createLinearGradient(fTL.x, fTL.y, fTL.x, fBL.y);
+      grad.addColorStop(0, '#ff5c3d');
+      grad.addColorStop(1, '#db3218');
+      ctx.fillStyle = grad;
+      ctx.fillRect(fTL.x, fTL.y, fw, fh);
+
+      // Diagonal hazard stripes clipped to front face
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(fTL.x, fTL.y, fw, fh);
+      ctx.clip();
+      ctx.fillStyle = 'rgba(12, 14, 16, 0.18)';
+      const stripeW = Math.max(8, 22 * fTL.s);
+      for (let sx = fTL.x - fh; sx < fTR.x + fh; sx += stripeW * 2.2) {
+        ctx.beginPath();
+        ctx.moveTo(sx, fBL.y);
+        ctx.lineTo(sx + stripeW, fBL.y);
+        ctx.lineTo(sx + stripeW + fh * 0.45, fTL.y);
+        ctx.lineTo(sx + fh * 0.45, fTL.y);
+        ctx.closePath();
+        ctx.fill();
+      }
+      ctx.restore();
+
+      // Bright edge bevel for razor-sharp 3D read
+      ctx.strokeStyle = 'rgba(255, 200, 185, 0.72)';
+      ctx.lineWidth = Math.max(1, 2.2 * fTL.s);
+      ctx.strokeRect(fTL.x, fTL.y, fw, fh);
+    }
+
+    // 3. Low Beam bottom clearance lip & badge
+    if (isBeam && fw > 90) {
+      ctx.fillStyle = isBeamCleared ? COLORS.volt : '#fff1ec';
+      const lipH = Math.max(2, 4 * fTL.s);
+      ctx.fillRect(fBL.x, fBL.y - lipH, fw, lipH);
+
+      const fontSize = clamp(Math.round(13 * fTL.s), 9, 15);
+      const badgeText = isBeamCleared ? 'CLEAR ✓' : 'DUCK UNDER';
+      ctx.font = `700 ${fontSize}px "JetBrains Mono", monospace`;
+      const tw = ctx.measureText(badgeText).width;
+      const bw = tw + 16;
+      const bh = fontSize + 10;
+      const bx = fBL.x + (fw - bw) * 0.5;
+      const by = fBL.y - bh - Math.max(8, 12 * fTL.s);
+
+      ctx.fillStyle = isBeamCleared ? COLORS.volt : 'rgba(12, 14, 16, 0.88)';
+      this._roundRect(ctx, bx, by, bw, bh, 5);
+      ctx.fill();
+      ctx.fillStyle = isBeamCleared ? '#0b0e05' : '#ffffff';
+      ctx.textAlign = 'center';
+      ctx.fillText(badgeText, fBL.x + fw * 0.5, by + bh - 6);
+      ctx.textAlign = 'left';
+    }
+
+    ctx.restore();
+  }
+
+  _draw3DRing(ctx, ring, cam) {
+    const pt = this._project(ring.wx, ring.wy, ring.z, cam);
+    const floorPt = this._project(ring.wx, 1.0, ring.z, cam);
+
+    const farFade = clamp((SPAWN_Z - ring.z) * 4.5 + 0.25, 0.2, 1);
+    const nearFade = ring.z < -0.02 ? clamp(1 - (-0.02 - ring.z) / 0.14, 0, 1) : 1;
+    const alpha = farFade * nearFade;
+    if (alpha <= 0.01) return;
+
+    const r = clamp(this.playW * 0.048, 16, 22) * pt.s;
+    const spinScaleX = 0.48 + Math.abs(Math.cos(ring.spin)) * 0.52;
+
+    ctx.save();
+    ctx.globalAlpha = alpha;
+
+    // Subtle amber floor reflection shadow for instant 3D depth grounding
+    ctx.fillStyle = 'rgba(255, 184, 46, 0.24)';
     ctx.beginPath();
-    ctx.moveTo(this.playLeft + 14, py);
-    ctx.lineTo(this.playRight - 14, py);
+    ctx.ellipse(floorPt.x, floorPt.y - 2, r * 0.85, Math.max(2, r * 0.22), 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Soft halo
+    ctx.translate(pt.x, pt.y);
+    ctx.fillStyle = 'rgba(255, 184, 46, 0.18)';
+    ctx.beginPath();
+    ctx.arc(0, 0, r * 1.35, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Spinning 3D gold ring
+    ctx.scale(spinScaleX, 1);
+    ctx.strokeStyle = COLORS.amber;
+    ctx.lineWidth = Math.max(2, 4.4 * pt.s);
+    ctx.beginPath();
+    ctx.arc(0, 0, r, 0, Math.PI * 2);
     ctx.stroke();
-    ctx.setLineDash([]);
+
+    ctx.strokeStyle = '#fff2cc';
+    ctx.lineWidth = Math.max(1, 1.6 * pt.s);
+    ctx.beginPath();
+    ctx.arc(0, 0, Math.max(1, r - 3.5 * pt.s), -Math.PI * 0.65, Math.PI * 0.15);
+    ctx.stroke();
+
     ctx.restore();
   }
 
@@ -1254,66 +1620,96 @@ class SwerveGame {
       const isDucked = p.isDucked;
 
       ctx.save();
-      ctx.strokeStyle = isDucked ? COLORS.volt : 'rgba(255, 255, 255, 0.34)';
-      ctx.lineWidth = isDucked ? 2.2 : 1.5;
-      ctx.setLineDash(isDucked ? [] : [7, 7]);
+      ctx.strokeStyle = isDucked ? COLORS.volt : 'rgba(255, 255, 255, 0.26)';
+      ctx.lineWidth = isDucked ? 1.8 : 1.2;
+      ctx.setLineDash(isDucked ? [] : [6, 7]);
       ctx.beginPath();
-      ctx.moveTo(this.playLeft + 12, duckY);
-      ctx.lineTo(this.playRight - 12, duckY);
+      ctx.moveTo(this.playLeft + 14, duckY);
+      ctx.lineTo(this.playRight - 14, duckY);
       ctx.stroke();
       ctx.setLineDash([]);
 
-      // Small clearance pill tag on the right edge
-      ctx.font = '700 10px "JetBrains Mono", monospace';
+      ctx.font = '700 9.5px "JetBrains Mono", monospace';
       const label = isDucked ? 'DUCK CLEAR' : 'DUCK LINE';
       const textW = ctx.measureText(label).width;
       const bx = this.playRight - textW - 22;
-      const by = duckY - 18;
-      ctx.fillStyle = isDucked ? COLORS.volt : 'rgba(12, 14, 16, 0.78)';
-      this._roundRect(ctx, bx, by, textW + 12, 16, 5);
+      const by = duckY - 17;
+      ctx.fillStyle = isDucked ? COLORS.volt : 'rgba(12, 14, 16, 0.72)';
+      this._roundRect(ctx, bx, by, textW + 10, 15, 4);
       ctx.fill();
-      ctx.fillStyle = isDucked ? '#0b0e05' : 'rgba(242, 245, 247, 0.72)';
-      ctx.fillText(label, bx + 6, by + 11.5);
+      ctx.fillStyle = isDucked ? '#0b0e05' : 'rgba(242, 245, 247, 0.66)';
+      ctx.fillText(label, bx + 5, by + 10.5);
 
-      // Subtle neutral center crosshair mark
+      // Compact neutral crosshair
       const nx = p.neutralX * this.viewW;
       const ny = p.neutralY * this.viewH;
-      ctx.strokeStyle = 'rgba(200, 245, 59, 0.32)';
-      ctx.lineWidth = 1.25;
+      ctx.strokeStyle = 'rgba(200, 245, 59, 0.28)';
+      ctx.lineWidth = 1;
       ctx.beginPath();
-      ctx.moveTo(nx - 8, ny);
-      ctx.lineTo(nx + 8, ny);
-      ctx.moveTo(nx, ny - 8);
-      ctx.lineTo(nx, ny + 8);
+      ctx.moveTo(nx - 6, ny);
+      ctx.lineTo(nx + 6, ny);
+      ctx.moveTo(nx, ny - 6);
+      ctx.lineTo(nx, ny + 6);
       ctx.stroke();
       ctx.restore();
     }
 
-    // 2. Calibration framing reticle during 1.4s calibration
+    // 2. Alignment Target Box during Calibration (waits until user aligns inside!)
     if (this.state === 'calibrating') {
-      const cx = this.viewW * 0.5;
-      const cy = this.viewH * 0.43;
-      const rx = Math.min(this.playW * 0.34, 130);
-      const ry = Math.min(this.viewH * 0.19, 155);
+      const align = p.alignment || { aligned: false };
+      const boxLeft = (ALIGN_BOUNDS.centerX - ALIGN_BOUNDS.halfW) * this.viewW;
+      const boxRight = (ALIGN_BOUNDS.centerX + ALIGN_BOUNDS.halfW) * this.viewW;
+      const boxTop = ALIGN_BOUNDS.minY * this.viewH;
+      const boxBottom = ALIGN_BOUNDS.maxY * this.viewH;
+      const boxCx = ALIGN_BOUNDS.centerX * this.viewW;
+      const boxCy = ALIGN_BOUNDS.centerY * this.viewH;
+      const cornerLen = 18;
 
       ctx.save();
-      ctx.strokeStyle = p.hasPose ? 'rgba(200, 245, 59, 0.55)' : 'rgba(255, 184, 46, 0.45)';
-      ctx.lineWidth = 2;
-      ctx.setLineDash([8, 8]);
-      ctx.beginPath();
-      ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
-      ctx.stroke();
-      ctx.setLineDash([]);
+      const boxColor = align.aligned ? COLORS.volt : COLORS.amber;
+      ctx.strokeStyle = boxColor;
+      ctx.lineWidth = align.aligned ? 2.4 : 1.8;
 
-      // Progress ring around tracked center
-      if (p.hasPose && p.trackedPointPx) {
+      // Sleek viewfinder corner brackets
+      const drawBracket = (x, y, dx, dy) => {
+        ctx.beginPath();
+        ctx.moveTo(x + dx * cornerLen, y);
+        ctx.lineTo(x, y);
+        ctx.lineTo(x, y + dy * cornerLen);
+        ctx.stroke();
+      };
+      drawBracket(boxLeft, boxTop, 1, 1);
+      drawBracket(boxRight, boxTop, -1, 1);
+      drawBracket(boxLeft, boxBottom, 1, -1);
+      drawBracket(boxRight, boxBottom, -1, -1);
+
+      // Subtle center target dot
+      ctx.strokeStyle = align.aligned ? 'rgba(200, 245, 59, 0.45)' : 'rgba(255, 184, 46, 0.35)';
+      ctx.lineWidth = 1.2;
+      ctx.beginPath();
+      ctx.arc(boxCx, boxCy, 14, 0, Math.PI * 2);
+      ctx.stroke();
+
+      // If user is detected but off-center, draw subtle guide line to center target
+      if (p.hasPose && p.trackedPointPx && !align.aligned) {
+        ctx.strokeStyle = 'rgba(255, 184, 46, 0.55)';
+        ctx.setLineDash([4, 4]);
+        ctx.beginPath();
+        ctx.moveTo(p.trackedPointPx.x, p.trackedPointPx.y);
+        ctx.lineTo(boxCx, boxCy);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+
+      // Compact calibration progress ring around tracked point once aligned
+      if (p.hasPose && p.trackedPointPx && p.calibrationProgress > 0) {
         ctx.strokeStyle = COLORS.volt;
-        ctx.lineWidth = 4;
+        ctx.lineWidth = 3;
         ctx.beginPath();
         ctx.arc(
           p.trackedPointPx.x,
           p.trackedPointPx.y,
-          28,
+          18,
           -Math.PI / 2,
           -Math.PI / 2 + Math.PI * 2 * p.calibrationProgress
         );
@@ -1322,13 +1718,13 @@ class SwerveGame {
       ctx.restore();
     }
 
-    // 3. Upper-body pose skeleton aligned to mirrored video
+    // 3. Sleek, smaller upper-body skeleton overlay aligned to mirrored cover-fit video
     const lms = p.mappedLandmarks;
     if (!p.hasPose || !lms) return;
 
     ctx.save();
-    ctx.strokeStyle = 'rgba(200, 245, 59, 0.55)';
-    ctx.lineWidth = 2.5;
+    ctx.strokeStyle = 'rgba(200, 245, 59, 0.36)';
+    ctx.lineWidth = 1.5;
     ctx.lineCap = 'round';
 
     for (const [aIdx, bIdx] of UPPER_BODY_CONNECTIONS) {
@@ -1342,10 +1738,9 @@ class SwerveGame {
       }
     }
 
-    // Connect nose to mid-shoulders for crisp upper-body anchor visual
     if (p.nosePx && p.midShoulderPx) {
-      ctx.strokeStyle = 'rgba(200, 245, 59, 0.42)';
-      ctx.setLineDash([4, 4]);
+      ctx.strokeStyle = 'rgba(200, 245, 59, 0.28)';
+      ctx.setLineDash([3, 4]);
       ctx.beginPath();
       ctx.moveTo(p.nosePx.x, p.nosePx.y);
       ctx.lineTo(p.midShoulderPx.x, p.midShoulderPx.y);
@@ -1353,27 +1748,26 @@ class SwerveGame {
       ctx.setLineDash([]);
     }
 
-    // Landmark joints
     for (const idx of [11, 12, 13, 14, 15, 16]) {
       const lm = lms[idx];
       if (!lm || lm.visibility < 0.35) continue;
       const isShoulder = idx === 11 || idx === 12;
-      ctx.fillStyle = isShoulder ? COLORS.volt : 'rgba(242, 245, 247, 0.78)';
+      ctx.fillStyle = isShoulder ? 'rgba(200, 245, 59, 0.85)' : 'rgba(242, 245, 247, 0.55)';
       ctx.beginPath();
-      ctx.arc(lm.x, lm.y, isShoulder ? 5 : 3.5, 0, Math.PI * 2);
+      ctx.arc(lm.x, lm.y, isShoulder ? 3.2 : 2.1, 0, Math.PI * 2);
       ctx.fill();
     }
 
-    // Weighted tracked Nose + Mid-Shoulders core dot
+    // Compact tracked Nose + Mid-Shoulders center pip
     if (p.trackedPointPx) {
-      const pulse = 1 + Math.sin(nowMs * 0.008) * 0.14;
-      ctx.fillStyle = p.isDucked ? COLORS.volt : 'rgba(200, 245, 59, 0.92)';
+      const pulse = 1 + Math.sin(nowMs * 0.008) * 0.1;
+      ctx.fillStyle = COLORS.volt;
       ctx.beginPath();
-      ctx.arc(p.trackedPointPx.x, p.trackedPointPx.y, 6.5 * pulse, 0, Math.PI * 2);
+      ctx.arc(p.trackedPointPx.x, p.trackedPointPx.y, 4 * pulse, 0, Math.PI * 2);
       ctx.fill();
 
       ctx.strokeStyle = '#0c0e10';
-      ctx.lineWidth = 2;
+      ctx.lineWidth = 1.4;
       ctx.stroke();
     }
 
@@ -1381,12 +1775,12 @@ class SwerveGame {
   }
 
   _drawPracticeDuckZone(ctx) {
-    const duckZoneY = this.viewH * 0.74;
+    const duckZoneY = this.viewH * 0.72;
     const active = this.player.isDucked;
     ctx.save();
-    ctx.strokeStyle = active ? 'rgba(200, 245, 59, 0.55)' : 'rgba(255, 255, 255, 0.12)';
-    ctx.lineWidth = 1.5;
-    ctx.setLineDash([6, 8]);
+    ctx.strokeStyle = active ? 'rgba(200, 245, 59, 0.5)' : 'rgba(255, 255, 255, 0.12)';
+    ctx.lineWidth = 1.25;
+    ctx.setLineDash([5, 7]);
     ctx.beginPath();
     ctx.moveTo(this.playLeft + 14, duckZoneY);
     ctx.lineTo(this.playRight - 14, duckZoneY);
@@ -1394,183 +1788,55 @@ class SwerveGame {
     ctx.setLineDash([]);
 
     if (this.pointer.active || active) {
-      ctx.font = '700 10px "JetBrains Mono", monospace';
+      ctx.font = '700 9.5px "JetBrains Mono", monospace';
       ctx.fillStyle = active ? COLORS.volt : 'rgba(255, 255, 255, 0.42)';
       ctx.textAlign = 'right';
-      ctx.fillText(active ? 'DUCKED' : 'DUCK ZONE', this.playRight - 16, duckZoneY + 14);
+      ctx.fillText(active ? 'DUCKED' : 'DUCK ZONE', this.playRight - 16, duckZoneY + 13);
       ctx.textAlign = 'left';
     }
     ctx.restore();
   }
 
-  _drawObstacles(ctx, nowMs) {
-    const hudRect = this.hudEl.getBoundingClientRect();
-    const telegraphTopY = Math.max(12, Math.round(hudRect.bottom) + 4);
-
-    for (const obs of this.obstacles) {
-      const ox = this.playLeft + obs.xNorm * this.playW;
-      const ow = obs.wNorm * this.playW;
-
-      if (obs.state === 'telegraph') {
-        const progress = clamp(obs.telegraphTimer / obs.telegraphDuration, 0, 1);
-        const pulse = 0.55 + Math.sin(nowMs * 0.025) * 0.35;
-        const isBeam = obs.type === 'lowBeam';
-        const isSafeBeam = isBeam && this.player.isDucked;
-        const baseColor = isSafeBeam ? COLORS.volt : COLORS.vermilion;
-
-        ctx.save();
-        // Top-edge telegraph track
-        ctx.fillStyle = isSafeBeam ? 'rgba(200, 245, 59, 0.2)' : 'rgba(255, 77, 46, 0.22)';
-        this._roundRect(ctx, ox + 3, telegraphTopY, ow - 6, 10, 5);
-        ctx.fill();
-
-        // Filling charge bar
-        ctx.fillStyle = baseColor;
-        ctx.globalAlpha = clamp(0.65 + progress * 0.35, 0, 1);
-        const fillW = Math.max(10, (ow - 6) * progress);
-        const fillX = ox + 3 + ((ow - 6) - fillW) * 0.5;
-        this._roundRect(ctx, fillX, telegraphTopY, fillW, 10, 5);
-        ctx.fill();
-
-        // Downward hazard warning arrow / label
-        ctx.globalAlpha = pulse;
-        ctx.font = '700 11px "JetBrains Mono", monospace';
-        ctx.textAlign = 'center';
-        ctx.fillStyle = baseColor;
-        const cx = ox + ow * 0.5;
-        ctx.fillText(isBeam ? '▼ LOW BEAM · DUCK ▼' : '▼', cx, telegraphTopY + 24);
-        ctx.textAlign = 'left';
-        ctx.restore();
-        continue;
-      }
-
-      // Active falling obstacle
-      ctx.save();
-      const isBeam = obs.type === 'lowBeam';
-      const isBeamCleared = isBeam && this.player.isDucked;
-      const mainColor = isBeamCleared ? COLORS.volt : COLORS.vermilion;
-      const padX = isBeam ? 6 : 4;
-      const drawX = ox + padX;
-      const drawW = ow - padX * 2;
-      const radius = 8;
-
-      // Subtle shadow behind hazard bar
-      ctx.fillStyle = 'rgba(0, 0, 0, 0.45)';
-      this._roundRect(ctx, drawX, obs.y + 4, drawW, obs.h, radius);
-      ctx.fill();
-
-      // Main high-contrast bar body
-      ctx.fillStyle = isBeamCleared ? 'rgba(200, 245, 59, 0.24)' : mainColor;
-      this._roundRect(ctx, drawX, obs.y, drawW, obs.h, radius);
-      ctx.fill();
-
-      // Crisp outline for low beam when safe/ducked
-      if (isBeamCleared) {
-        ctx.strokeStyle = COLORS.volt;
-        ctx.lineWidth = 2.5;
-        this._roundRect(ctx, drawX, obs.y, drawW, obs.h, radius);
-        ctx.stroke();
-      } else {
-        // Diagonal studio hazard chevrons clipped inside bar
-        ctx.save();
-        this._roundRect(ctx, drawX, obs.y, drawW, obs.h, radius);
-        ctx.clip();
-        ctx.fillStyle = 'rgba(12, 14, 16, 0.22)';
-        const stripeW = 14;
-        for (let sx = drawX - obs.h; sx < drawX + drawW + obs.h; sx += stripeW * 2) {
-          ctx.beginPath();
-          ctx.moveTo(sx, obs.y + obs.h);
-          ctx.lineTo(sx + stripeW, obs.y + obs.h);
-          ctx.lineTo(sx + stripeW + obs.h * 0.65, obs.y);
-          ctx.lineTo(sx + obs.h * 0.65, obs.y);
-          ctx.closePath();
-          ctx.fill();
-        }
-        ctx.restore();
-      }
-
-      // Bright leading bottom edge for razor-sharp timing read
-      ctx.fillStyle = isBeamCleared ? COLORS.volt : '#ff9b87';
-      ctx.fillRect(drawX + 6, obs.y + obs.h - 3, drawW - 12, 3);
-
-      // Low Beam center badge
-      if (isBeam) {
-        const badgeText = isBeamCleared ? 'CLEAR ✓' : 'LOW BEAM · DUCK';
-        ctx.font = '700 12px "JetBrains Mono", monospace';
-        const tw = ctx.measureText(badgeText).width;
-        const bx = drawX + (drawW - (tw + 18)) * 0.5;
-        const by = obs.y + (obs.h - 20) * 0.5;
-        ctx.fillStyle = isBeamCleared ? COLORS.volt : '#0c0e10';
-        this._roundRect(ctx, bx, by, tw + 18, 20, 6);
-        ctx.fill();
-        ctx.fillStyle = isBeamCleared ? '#0b0e05' : '#ffffff';
-        ctx.textAlign = 'center';
-        ctx.fillText(badgeText, drawX + drawW * 0.5, by + 14);
-        ctx.textAlign = 'left';
-      }
-
-      ctx.restore();
-    }
-  }
-
-  _drawGoldRings(ctx) {
-    const r = clamp(this.playW * 0.044, 15, 21);
-
-    for (const ring of this.rings) {
-      if (!ring.active || ring.collected) continue;
-      const rx = this.playLeft + ring.xNorm * this.playW;
-      const scaleX = 0.55 + Math.abs(Math.cos(ring.spin)) * 0.45;
-
-      ctx.save();
-      ctx.translate(rx, ring.y);
-
-      // Soft warm amber halo
-      ctx.fillStyle = 'rgba(255, 184, 46, 0.16)';
-      ctx.beginPath();
-      ctx.arc(0, 0, r * 1.32, 0, Math.PI * 2);
-      ctx.fill();
-
-      // Rotating studio ring
-      ctx.scale(scaleX, 1);
-      ctx.strokeStyle = COLORS.amber;
-      ctx.lineWidth = 4.5;
-      ctx.beginPath();
-      ctx.arc(0, 0, r, 0, Math.PI * 2);
-      ctx.stroke();
-
-      // Inner bright core highlight
-      ctx.strokeStyle = '#fff1c9';
-      ctx.lineWidth = 1.6;
-      ctx.beginPath();
-      ctx.arc(0, 0, r - 4.5, -Math.PI * 0.65, Math.PI * 0.15);
-      ctx.stroke();
-
-      ctx.restore();
-    }
-  }
-
   _drawPlayerCore(ctx, nowMs) {
-    // Invulnerability blink
     if (this.invulnTimer > 0 && Math.floor(nowMs / 75) % 2 === 0) {
       return;
     }
 
     const pm = this._getPlayerMetrics();
     const duck = this.player.duckAnim;
-    const tilt = clamp(this.player.vx * 0.18, -0.35, 0.35);
+    const tilt = clamp(this.player.vx * 0.18, -0.32, 0.32);
 
-    // Subtle motion trail
+    // 1. 3D Floor shadow directly beneath player core (spatial depth anchor)
+    ctx.save();
+    const shadowAlpha = 0.24 + duck * 0.22;
+    ctx.fillStyle = `rgba(200, 245, 59, ${shadowAlpha.toFixed(2)})`;
+    ctx.beginPath();
+    ctx.ellipse(pm.floorX, pm.floorY - 2, pm.r * (1.05 + duck * 0.35), 4, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Subtle vertical laser tether from core down to floor shadow
+    ctx.strokeStyle = 'rgba(200, 245, 59, 0.16)';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([3, 4]);
+    ctx.beginPath();
+    ctx.moveTo(pm.x, pm.y + pm.r);
+    ctx.lineTo(pm.floorX, pm.floorY - 4);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.restore();
+
+    // 2. Sleek compact motion trail
     ctx.save();
     for (let i = 1; i < this.player.trail.length; i++) {
       const tPt = this.player.trail[i];
       const frac = 1 - i / this.player.trail.length;
-      ctx.fillStyle = `rgba(200, 245, 59, ${(frac * 0.18).toFixed(3)})`;
+      ctx.fillStyle = `rgba(200, 245, 59, ${(frac * 0.16).toFixed(3)})`;
       ctx.beginPath();
       ctx.ellipse(
         tPt.x,
         tPt.y,
-        pm.r * (0.72 + frac * 0.25) * (1 + tPt.duck * 0.18),
-        pm.r * (0.72 + frac * 0.25) * (1 - tPt.duck * 0.42),
+        pm.r * (0.65 + frac * 0.28) * (1 + tPt.duck * 0.18),
+        pm.r * (0.65 + frac * 0.28) * (1 - tPt.duck * 0.38),
         0,
         0,
         Math.PI * 2
@@ -1579,47 +1845,47 @@ class SwerveGame {
     }
     ctx.restore();
 
+    // 3. Smaller, crisp tennis-volt studio reticle core
     ctx.save();
     ctx.translate(pm.x, pm.y);
     ctx.rotate(tilt);
 
     const sx = 1 + duck * 0.22;
-    const sy = 1 - duck * 0.44;
+    const sy = 1 - duck * 0.38;
     ctx.scale(sx, sy);
 
-    // Outer clearance halo
-    ctx.fillStyle = this.player.isDucked ? 'rgba(200, 245, 59, 0.28)' : 'rgba(200, 245, 59, 0.16)';
+    // Tight clearance ring
+    ctx.strokeStyle = this.player.isDucked ? 'rgba(200, 245, 59, 0.7)' : 'rgba(200, 245, 59, 0.3)';
+    ctx.lineWidth = 1.5;
     ctx.beginPath();
-    ctx.arc(0, 0, pm.r * 1.42, 0, Math.PI * 2);
-    ctx.fill();
+    ctx.arc(0, 0, pm.r * 1.32, 0, Math.PI * 2);
+    ctx.stroke();
 
-    // Main tennis-volt tactile puck
+    // Core puck
     ctx.fillStyle = COLORS.volt;
     ctx.beginPath();
     ctx.arc(0, 0, pm.r, 0, Math.PI * 2);
     ctx.fill();
 
-    // High-contrast charcoal inner ring & reticle dot
-    ctx.strokeStyle = '#0c0e10';
-    ctx.lineWidth = 3;
-    ctx.beginPath();
-    ctx.arc(0, 0, pm.r * 0.64, 0, Math.PI * 2);
-    ctx.stroke();
-
+    // Crisp charcoal precision center diamond
     ctx.fillStyle = '#0c0e10';
+    const d = pm.r * 0.44;
     ctx.beginPath();
-    ctx.arc(0, 0, pm.r * 0.22, 0, Math.PI * 2);
+    ctx.moveTo(0, -d);
+    ctx.lineTo(d, 0);
+    ctx.lineTo(0, d);
+    ctx.lineTo(-d, 0);
+    ctx.closePath();
     ctx.fill();
 
     ctx.restore();
 
-    // Ducked status pill right beneath player core
     if (this.player.isDucked) {
       ctx.save();
-      ctx.font = '700 10px "JetBrains Mono", monospace';
+      ctx.font = '700 9.5px "JetBrains Mono", monospace';
       ctx.textAlign = 'center';
       ctx.fillStyle = COLORS.volt;
-      ctx.fillText('DUCKED', pm.x, pm.y + pm.r + 16);
+      ctx.fillText('DUCKED', pm.x, pm.y + pm.r + 14);
       ctx.textAlign = 'left';
       ctx.restore();
     }
@@ -1657,10 +1923,10 @@ class SwerveGame {
     ctx.save();
     const alpha = clamp(this.readyTimer / 0.6, 0, 1);
     ctx.globalAlpha = Math.min(1, alpha * 1.8);
-    ctx.font = '700 44px "Space Grotesk", sans-serif';
+    ctx.font = '700 42px "Space Grotesk", sans-serif';
     ctx.textAlign = 'center';
     ctx.fillStyle = COLORS.volt;
-    ctx.shadowColor = 'rgba(0, 0, 0, 0.6)';
+    ctx.shadowColor = 'rgba(0, 0, 0, 0.65)';
     ctx.shadowBlur = 16;
     ctx.fillText('SWERVE!', this.viewW * 0.5, this.viewH * 0.44);
     ctx.restore();

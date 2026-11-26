@@ -1,6 +1,7 @@
 // SWERVE — On-device MediaPipe Pose Landmarker tracker
 // Handles front camera capture, GPU->CPU delegate fallback, mirrored cover-fit
-// projection, weighted Nose + Mid-Shoulders EMA tracking, and 1.4s calibration.
+// projection, weighted Nose + Mid-Shoulders EMA tracking, alignment gating,
+// and 1.4s neutral posture calibration.
 
 const MEDIAPIPE_ESM_URL = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision/vision_bundle.mjs';
 const MEDIAPIPE_WASM_URL = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision/wasm';
@@ -28,6 +29,19 @@ const SENSITIVITY_MULTIPLIERS = {
 
 const CALIBRATION_DURATION_MS = 1400;
 const MIN_VISIBILITY = 0.35;
+const ALIGN_VISIBILITY = 0.42;
+
+// Alignment target window (normalized viewport coordinates)
+export const ALIGN_BOUNDS = {
+  centerX: 0.5,
+  centerY: 0.42,
+  halfW: 0.16,
+  minY: 0.2,
+  maxY: 0.62,
+  minSpanW: 0.12,
+  maxSpanW: 0.74,
+  maxSpeed: 0.42,
+};
 
 function clamp(v, min, max) {
   return Math.max(min, Math.min(max, v));
@@ -53,14 +67,23 @@ export class PoseTracker {
 
     // Smoothed viewport-normalized tracking state
     this.hasPose = false;
+    this.hasFullUpperBody = false;
     this.poseLostTimer = 0;
     this.smoothX = 0.5;
     this.smoothY = 0.42;
     this.smoothSpanW = 0.24;
     this.smoothSpanH = 0.16;
+    this.motionSpeed = 0;
     this.rawX = 0.5;
     this.rawY = 0.42;
     this.hasInitialSample = false;
+
+    // Alignment telemetry
+    this.alignment = {
+      aligned: false,
+      reason: 'no_pose',
+      hint: 'Step into frame · show head & shoulders',
+    };
 
     // Calibration state
     this.calibrated = false;
@@ -74,7 +97,7 @@ export class PoseTracker {
 
     // Hysteresis duck state
     this.isDucked = false;
-    this.duckProgress = 0; // 0..1 visual meter toward duck threshold
+    this.duckProgress = 0;
 
     // Latest mapped viewport landmarks for skeleton overlay
     this.mappedLandmarks = null;
@@ -145,8 +168,6 @@ export class PoseTracker {
     }
 
     onStatus('Requesting front camera…');
-
-    // Stop any existing stream cleanly
     this.stopCamera();
 
     const constraints = {
@@ -222,8 +243,10 @@ export class PoseTracker {
     }
     this.cameraActive = false;
     this.hasPose = false;
+    this.hasFullUpperBody = false;
     this.hasInitialSample = false;
     this.poseLostTimer = 0;
+    this.motionSpeed = 0;
     this.mappedLandmarks = null;
   }
 
@@ -234,6 +257,11 @@ export class PoseTracker {
     this.calibrationSamples = [];
     this.isDucked = false;
     this.duckProgress = 0;
+    this.alignment = {
+      aligned: false,
+      reason: 'no_pose',
+      hint: 'Step into frame · show head & shoulders',
+    };
   }
 
   recenter() {
@@ -300,6 +328,86 @@ export class PoseTracker {
     };
   }
 
+  _evaluateAlignment() {
+    if (!this.hasPose) {
+      return {
+        aligned: false,
+        reason: 'no_pose',
+        hint: 'Step into frame · show head & shoulders',
+      };
+    }
+
+    if (!this.hasFullUpperBody) {
+      return {
+        aligned: false,
+        reason: 'missing_shoulders',
+        hint: 'Keep head & both shoulders inside frame',
+      };
+    }
+
+    if (this.smoothSpanW < ALIGN_BOUNDS.minSpanW) {
+      return {
+        aligned: false,
+        reason: 'too_far',
+        hint: 'Move slightly closer to camera',
+      };
+    }
+
+    if (this.smoothSpanW > ALIGN_BOUNDS.maxSpanW) {
+      return {
+        aligned: false,
+        reason: 'too_close',
+        hint: 'Step back slightly from camera',
+      };
+    }
+
+    if (this.smoothX < ALIGN_BOUNDS.centerX - ALIGN_BOUNDS.halfW) {
+      return {
+        aligned: false,
+        reason: 'move_right',
+        hint: 'Move slightly right to center →',
+      };
+    }
+
+    if (this.smoothX > ALIGN_BOUNDS.centerX + ALIGN_BOUNDS.halfW) {
+      return {
+        aligned: false,
+        reason: 'move_left',
+        hint: '← Move slightly left to center',
+      };
+    }
+
+    if (this.smoothY < ALIGN_BOUNDS.minY) {
+      return {
+        aligned: false,
+        reason: 'too_high',
+        hint: 'Lower head or tilt phone up',
+      };
+    }
+
+    if (this.smoothY > ALIGN_BOUNDS.maxY) {
+      return {
+        aligned: false,
+        reason: 'too_low',
+        hint: 'Raise posture or tilt phone down',
+      };
+    }
+
+    if (this.motionSpeed > ALIGN_BOUNDS.maxSpeed) {
+      return {
+        aligned: false,
+        reason: 'moving',
+        hint: 'Hold steady to lock posture…',
+      };
+    }
+
+    return {
+      aligned: true,
+      reason: 'aligned',
+      hint: 'Aligned — locking neutral posture…',
+    };
+  }
+
   update(nowMs, dtSec, viewW, viewH) {
     const video = this.videoEl;
     if (
@@ -314,11 +422,9 @@ export class PoseTracker {
       return this.getState();
     }
 
-    // Only run inference when the video has a fresh frame
     const vidTime = video.currentTime;
     if (vidTime !== this.lastVideoTime) {
       this.lastVideoTime = vidTime;
-      // Ensure strictly increasing timestamp for MediaPipe VIDEO mode
       const ts = nowMs > this.lastDetectTimestamp ? nowMs : this.lastDetectTimestamp + 1;
       this.lastDetectTimestamp = ts;
 
@@ -336,14 +442,16 @@ export class PoseTracker {
         this.poseLostTimer += dtSec;
         if (this.poseLostTimer > 0.35) {
           this.hasPose = false;
+          this.hasFullUpperBody = false;
           this.mappedLandmarks = null;
         }
       }
     }
 
-    // Update calibration timer using live valid samples
+    // Wait until user is properly aligned and steady before advancing 1.4s calibration
     if (this.calibrating) {
-      if (this.hasPose) {
+      this.alignment = this._evaluateAlignment();
+      if (this.alignment.aligned) {
         this.calibrationElapsedMs += dtSec * 1000;
         this.calibrationSamples.push({
           x: this.smoothX,
@@ -356,8 +464,8 @@ export class PoseTracker {
           this._finalizeCalibration();
         }
       } else {
-        // Gently decay progress if user steps out of frame mid-calibration
-        this.calibrationElapsedMs = Math.max(0, this.calibrationElapsedMs - dtSec * 700);
+        // Smoothly reset countdown until user aligns cleanly inside target zone
+        this.calibrationElapsedMs = Math.max(0, this.calibrationElapsedMs - dtSec * 1000);
         if (this.calibrationElapsedMs === 0) {
           this.calibrationSamples = [];
         }
@@ -388,6 +496,7 @@ export class PoseTracker {
       this.poseLostTimer += dtSec;
       if (this.poseLostTimer > 0.35) {
         this.hasPose = false;
+        this.hasFullUpperBody = false;
         this.mappedLandmarks = null;
       }
       return;
@@ -395,10 +504,22 @@ export class PoseTracker {
 
     this.poseLostTimer = 0;
     this.hasPose = true;
+    this.hasFullUpperBody = Boolean(
+      nose &&
+        nose.visibility >= ALIGN_VISIBILITY &&
+        ls &&
+        ls.visibility >= ALIGN_VISIBILITY &&
+        rs &&
+        rs.visibility >= ALIGN_VISIBILITY &&
+        ls.nx > 0.02 &&
+        ls.nx < 0.98 &&
+        rs.nx > 0.02 &&
+        rs.nx < 0.98
+    );
+
     this.mappedLandmarks = mapped;
     this.nosePx = hasNose ? { x: nose.x, y: nose.y } : null;
 
-    // Mid-shoulders calculation (with single-shoulder fallback)
     let midShoulderX;
     let midShoulderY;
     let hasMidShoulder = false;
@@ -428,8 +549,6 @@ export class PoseTracker {
     let targetX;
     let targetY;
     if (hasNose && hasMidShoulder) {
-      // X blends nose responsiveness (0.45) with shoulder torso stability (0.55)
-      // Y emphasizes nose drop (0.65) + shoulders (0.35) for crisp duck detection
       targetX = nose.nx * 0.45 + midShoulderX * 0.55;
       targetY = nose.ny * 0.65 + midShoulderY * 0.35;
     } else if (hasNose) {
@@ -443,20 +562,27 @@ export class PoseTracker {
     this.rawX = targetX;
     this.rawY = targetY;
 
-    // Frame-rate independent EMA smoothing
+    // Frame-rate independent EMA smoothing + motion steadiness tracker
     if (!this.hasInitialSample) {
       this.smoothX = targetX;
       this.smoothY = targetY;
+      this.motionSpeed = 0;
       if (measuredSpanPx && measuredSpanPx > 12) {
         this.smoothSpanW = measuredSpanPx / viewW;
         this.smoothSpanH = measuredSpanPx / viewH;
       }
       this.hasInitialSample = true;
     } else {
+      const prevX = this.smoothX;
+      const prevY = this.smoothY;
       const aX = emaAlpha(dtSec, 0.052);
       const aY = emaAlpha(dtSec, 0.058);
       this.smoothX += (targetX - this.smoothX) * aX;
       this.smoothY += (targetY - this.smoothY) * aY;
+
+      const instSpeed = Math.hypot(this.smoothX - prevX, this.smoothY - prevY) / Math.max(0.016, dtSec);
+      const aMotion = emaAlpha(dtSec, 0.14);
+      this.motionSpeed += (instSpeed - this.motionSpeed) * aMotion;
 
       if (measuredSpanPx && measuredSpanPx > 12) {
         const aSpan = emaAlpha(dtSec, 0.16);
@@ -485,7 +611,6 @@ export class PoseTracker {
   }
 
   _finalizeCalibration() {
-    // Trimmed mean (drop outer 15% outliers) for rock-solid neutral capture
     const samples = this.calibrationSamples;
     const avgTrimmed = (key) => {
       const vals = samples.map((s) => s[key]).sort((a, b) => a - b);
@@ -508,7 +633,6 @@ export class PoseTracker {
   getLeanNormalized() {
     if (!this.hasPose) return 0;
     const dx = this.smoothX - this.neutralX;
-    // Scale lateral sway from shoulder span so both close desk play & standing feel consistent
     const baseSwayW = clamp(this.neutralSpanW * 0.72, 0.11, 0.28);
     const mult = SENSITIVITY_MULTIPLIERS[this.sensitivity] ?? 1.0;
     return clamp((dx / baseSwayW) * mult, -1, 1);
@@ -521,6 +645,8 @@ export class PoseTracker {
       cameraActive: this.cameraActive,
       delegate: this.delegate,
       hasPose: this.hasPose,
+      hasFullUpperBody: this.hasFullUpperBody,
+      alignment: this.alignment,
       calibrating: this.calibrating,
       calibrated: this.calibrated,
       calibrationProgress: this.getCalibrationProgress(),
