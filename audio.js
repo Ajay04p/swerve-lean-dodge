@@ -1,4 +1,4 @@
-// SWERVE — Zero-asset Web Audio API synthesizer
+// SWERVE — Zero-asset Web Audio API arcade synthesizer + mobile haptics
 // Unlocked on first user tap for iOS Safari / mobile browser compatibility.
 
 const STORAGE_MUTE_KEY = 'swerve_muted';
@@ -23,7 +23,7 @@ export class SoundEngine {
     try {
       localStorage.setItem(STORAGE_MUTE_KEY, this.muted ? '1' : '0');
     } catch {
-      // Ignore storage errors (e.g. private browsing)
+      // Ignore storage errors
     }
   }
 
@@ -37,7 +37,7 @@ export class SoundEngine {
     if (this.masterGain && this.ctx) {
       const now = this.ctx.currentTime;
       this.masterGain.gain.cancelScheduledValues(now);
-      this.masterGain.gain.setTargetAtTime(this.muted ? 0 : 0.72, now, 0.015);
+      this.masterGain.gain.setTargetAtTime(this.muted ? 0 : 0.75, now, 0.015);
     }
   }
 
@@ -50,6 +50,16 @@ export class SoundEngine {
     return this.muted;
   }
 
+  vibrate(pattern) {
+    try {
+      if (navigator.vibrate) {
+        navigator.vibrate(pattern);
+      }
+    } catch {
+      // Ignore on unsupported devices (e.g. iOS Safari)
+    }
+  }
+
   unlock() {
     const AudioCtx = window.AudioContext || window.webkitAudioContext;
     if (!AudioCtx) return false;
@@ -57,7 +67,7 @@ export class SoundEngine {
     if (!this.ctx) {
       this.ctx = new AudioCtx();
       this.masterGain = this.ctx.createGain();
-      this.masterGain.gain.value = this.muted ? 0 : 0.72;
+      this.masterGain.gain.value = this.muted ? 0 : 0.75;
       this.masterGain.connect(this.ctx.destination);
     }
 
@@ -67,7 +77,6 @@ export class SoundEngine {
 
     if (!this.unlocked) {
       try {
-        // Silent 1-sample buffer reliably unlocks Web Audio on iOS Safari
         const buffer = this.ctx.createBuffer(1, 1, 22050);
         const src = this.ctx.createBufferSource();
         src.buffer = buffer;
@@ -99,7 +108,7 @@ export class SoundEngine {
     duration = 0.12,
     delay = 0,
     gain = 0.2,
-    attack = 0.006,
+    attack = 0.005,
     filterFreq = null,
   }) {
     if (!this._canPlay()) return;
@@ -152,11 +161,11 @@ export class SoundEngine {
     if (freqEnd && freqEnd !== freqStart) {
       filter.frequency.exponentialRampToValueAtTime(Math.max(40, freqEnd), now + duration);
     }
-    filter.Q.value = 1.2;
+    filter.Q.value = 1.25;
 
     const env = this.ctx.createGain();
     env.gain.setValueAtTime(0.0001, now);
-    env.gain.linearRampToValueAtTime(gain, now + 0.008);
+    env.gain.linearRampToValueAtTime(gain, now + 0.006);
     env.gain.exponentialRampToValueAtTime(0.0001, now + duration);
 
     src.connect(filter);
@@ -170,68 +179,97 @@ export class SoundEngine {
   click() {
     this._playTone({
       type: 'triangle',
-      freqStart: 620,
-      freqEnd: 460,
+      freqStart: 680,
+      freqEnd: 480,
       duration: 0.045,
       gain: 0.11,
       attack: 0.003,
     });
   }
 
+  beatPulse(zoneIndex = 0, combo = 1, isDownbeat = false) {
+    // Subtle rhythmic synth bass pulse that builds energy as combo climbs
+    const roots = [55, 61.74, 65.41, 73.42]; // A1, B1, C2, D2
+    const root = roots[zoneIndex % roots.length];
+    const freq = isDownbeat ? root : root * 1.5;
+    const energy = Math.min(1, 0.35 + (combo - 1) * 0.08);
+
+    this._playTone({
+      type: 'triangle',
+      freqStart: freq * 1.6,
+      freqEnd: freq,
+      duration: isDownbeat ? 0.14 : 0.09,
+      gain: (isDownbeat ? 0.11 : 0.065) * energy,
+      attack: 0.004,
+      filterFreq: 320 + combo * 45,
+    });
+    if (isDownbeat && combo >= 4) {
+      this._playNoise({
+        duration: 0.04,
+        gain: 0.032,
+        filterType: 'highpass',
+        freqStart: 4200,
+        freqEnd: 6500,
+      });
+    }
+  }
+
   dodge(combo = 1) {
-    const semitoneBoost = Math.min(combo - 1, 10);
-    const root = 280 * Math.pow(2, semitoneBoost / 18);
+    const semitoneBoost = Math.min(combo - 1, 12);
+    const root = 293.66 * Math.pow(2, semitoneBoost / 16);
     this._playTone({
       type: 'triangle',
       freqStart: root,
-      freqEnd: root * 1.48,
-      duration: 0.095,
-      gain: 0.14,
-      attack: 0.005,
-      filterFreq: 2400,
+      freqEnd: root * 1.5,
+      duration: 0.1,
+      gain: 0.15,
+      attack: 0.004,
+      filterFreq: 2600,
     });
     this._playNoise({
-      duration: 0.06,
-      gain: 0.04,
+      duration: 0.065,
+      gain: 0.045,
       filterType: 'highpass',
-      freqStart: 1600,
-      freqEnd: 2800,
+      freqStart: 1800,
+      freqEnd: 3400,
     });
   }
 
   closeCall(combo = 1) {
-    const shift = Math.min(combo - 1, 8) * 18;
+    this.vibrate(18);
+    const shift = Math.min(combo - 1, 8) * 20;
     this._playTone({
       type: 'sine',
-      freqStart: 660 + shift,
-      freqEnd: 990 + shift,
+      freqStart: 700 + shift,
+      freqEnd: 1080 + shift,
       duration: 0.12,
-      gain: 0.18,
-      attack: 0.004,
+      gain: 0.19,
+      attack: 0.003,
     });
     this._playTone({
       type: 'triangle',
-      freqStart: 990 + shift,
-      freqEnd: 1320 + shift,
-      duration: 0.16,
-      delay: 0.05,
-      gain: 0.16,
-      attack: 0.005,
+      freqStart: 1080 + shift,
+      freqEnd: 1480 + shift,
+      duration: 0.18,
+      delay: 0.048,
+      gain: 0.17,
+      attack: 0.004,
     });
   }
 
   goldRing(combo = 1) {
+    this.vibrate(14);
     const pitchScale = Math.pow(2, Math.min(combo - 1, 6) / 24);
-    const notes = [659.25, 987.77, 1318.51]; // E5, B5, E6
+    const notes = [659.25, 987.77, 1318.51, 1567.98]; // E5, B5, E6, G6
     notes.forEach((freq, idx) => {
       this._playTone({
-        type: 'sine',
+        type: idx === 3 ? 'triangle' : 'sine',
         freqStart: freq * pitchScale,
-        freqEnd: freq * pitchScale * 1.01,
-        duration: 0.17,
-        delay: idx * 0.048,
+        freqEnd: freq * pitchScale * 1.015,
+        duration: 0.18,
+        delay: idx * 0.042,
         gain: 0.16 - idx * 0.02,
-        attack: 0.004,
+        attack: 0.003,
       });
     });
   }
@@ -239,62 +277,78 @@ export class SoundEngine {
   duck() {
     this._playTone({
       type: 'sine',
-      freqStart: 360,
-      freqEnd: 145,
+      freqStart: 380,
+      freqEnd: 140,
       duration: 0.11,
-      gain: 0.14,
+      gain: 0.15,
       attack: 0.004,
     });
     this._playNoise({
-      duration: 0.085,
-      gain: 0.055,
+      duration: 0.09,
+      gain: 0.06,
       filterType: 'lowpass',
-      freqStart: 1200,
-      freqEnd: 320,
+      freqStart: 1300,
+      freqEnd: 300,
+    });
+  }
+
+  zoneUp() {
+    this.vibrate([15, 30, 25]);
+    const notes = [440, 554.37, 659.25, 880]; // A major power surge
+    notes.forEach((f, idx) => {
+      this._playTone({
+        type: 'sawtooth',
+        freqStart: f,
+        freqEnd: f * 1.01,
+        duration: 0.24,
+        delay: idx * 0.055,
+        gain: 0.11,
+        attack: 0.006,
+        filterFreq: 2400,
+      });
     });
   }
 
   hit() {
-    // Punchy low impact + filtered crunch
+    this.vibrate([45, 35, 60]);
     this._playTone({
       type: 'sawtooth',
-      freqStart: 165,
-      freqEnd: 46,
-      duration: 0.24,
-      gain: 0.26,
-      attack: 0.004,
-      filterFreq: 520,
+      freqStart: 170,
+      freqEnd: 42,
+      duration: 0.26,
+      gain: 0.27,
+      attack: 0.003,
+      filterFreq: 560,
     });
     this._playTone({
       type: 'sine',
-      freqStart: 95,
-      freqEnd: 34,
-      duration: 0.26,
-      gain: 0.28,
+      freqStart: 98,
+      freqEnd: 32,
+      duration: 0.28,
+      gain: 0.3,
       attack: 0.003,
     });
     this._playNoise({
-      duration: 0.16,
-      gain: 0.22,
+      duration: 0.18,
+      gain: 0.24,
       filterType: 'bandpass',
-      freqStart: 750,
-      freqEnd: 140,
+      freqStart: 850,
+      freqEnd: 130,
     });
   }
 
   ready() {
-    // Crisp studio arcade lock-in triad (A4 -> C#5 -> E5)
-    const freqs = [440, 554.37, 659.25];
+    const freqs = [440, 554.37, 659.25, 880];
     freqs.forEach((f, idx) => {
       this._playTone({
         type: 'triangle',
         freqStart: f,
         freqEnd: f,
-        duration: 0.16,
-        delay: idx * 0.055,
+        duration: 0.17,
+        delay: idx * 0.05,
         gain: 0.15,
-        attack: 0.006,
-        filterFreq: 2800,
+        attack: 0.005,
+        filterFreq: 3000,
       });
     });
   }
@@ -311,17 +365,18 @@ export class SoundEngine {
   }
 
   gameOver() {
-    const notes = [392.0, 329.63, 261.63, 196.0]; // G4, E4, C4, G3
+    this.vibrate([60, 40, 90]);
+    const notes = [392.0, 329.63, 261.63, 196.0];
     notes.forEach((f, idx) => {
       this._playTone({
         type: 'sawtooth',
         freqStart: f,
-        freqEnd: f * 0.96,
-        duration: idx === notes.length - 1 ? 0.36 : 0.16,
+        freqEnd: f * 0.95,
+        duration: idx === notes.length - 1 ? 0.4 : 0.17,
         delay: idx * 0.095,
         gain: 0.14,
-        attack: 0.008,
-        filterFreq: 950,
+        attack: 0.007,
+        filterFreq: 980,
       });
     });
   }

@@ -1,7 +1,7 @@
 // SWERVE — 3D Perspective Lean & Dodge engine, renderer, controls, and UI
 
-import { SoundEngine } from './audio.js?v=5';
-import { PoseTracker, UPPER_BODY_CONNECTIONS, ALIGN_BOUNDS } from './tracker.js?v=5';
+import { SoundEngine } from './audio.js?v=6';
+import { PoseTracker, UPPER_BODY_CONNECTIONS, ALIGN_BOUNDS } from './tracker.js?v=6';
 
 const STORAGE_KEYS = {
   highScore: 'swerve_high_score',
@@ -19,15 +19,23 @@ const SENSITIVITY_HINTS = {
 };
 
 const COLORS = {
-  bg: '#0c0e10',
-  stage: '#121518',
+  bg: '#07090c',
+  stage: '#0e1217',
   volt: '#c8f53b',
+  cyan: '#32e6ff',
   vermilion: '#ff4d2e',
   vermilionSide: '#9e2613',
   vermilionDeep: '#6e190c',
   amber: '#ffb82e',
-  white: '#f2f5f7',
+  white: '#f4f7fa',
 };
+
+const ZONES = [
+  { tag: 'Z1', name: 'VOLT STUDIO', accent: '#c8f53b', rgb: '200, 245, 59', secondary: '50, 230, 255' },
+  { tag: 'Z2', name: 'SOLAR RUSH', accent: '#ffb82e', rgb: '255, 184, 46', secondary: '255, 110, 46' },
+  { tag: 'Z3', name: 'CYBER PULSE', accent: '#32e6ff', rgb: '50, 230, 255', secondary: '200, 245, 59' },
+  { tag: 'Z4', name: 'HYPER CORE', accent: '#d7ff4d', rgb: '215, 255, 77', secondary: '255, 184, 46' },
+];
 
 // 3D Corridor Perspective Constants
 const FOCAL_LENGTH = 0.29;
@@ -75,6 +83,7 @@ class SwerveGame {
 
     this.hudEl = document.getElementById('hud');
     this.shieldPips = Array.from(document.querySelectorAll('.shield-pip'));
+    this.zonePillEl = document.getElementById('zone-pill');
     this.comboPillEl = document.getElementById('combo-pill');
     this.scoreValueEl = document.getElementById('score-value');
     this.bestInlineEl = document.getElementById('best-inline');
@@ -128,6 +137,7 @@ class SwerveGame {
 
     this.screenGameover = document.getElementById('screen-gameover');
     this.gameoverNewBest = document.getElementById('gameover-new-best');
+    this.gameoverRank = document.getElementById('gameover-rank');
     this.gameoverScore = document.getElementById('gameover-score');
     this.gameoverBest = document.getElementById('gameover-best');
     this.statDodges = document.getElementById('stat-dodges');
@@ -165,9 +175,9 @@ class SwerveGame {
     this.playRight = this.viewW;
 
     // Runtime state
-    this.state = 'start'; // 'start' | 'loading' | 'calibrating' | 'ready' | 'playing' | 'paused' | 'gameover'
+    this.state = 'start';
     this.pauseReturnState = 'playing';
-    this.controlMode = 'camera'; // 'camera' | 'practice'
+    this.controlMode = 'camera';
     this.loadingCancelled = false;
 
     // Gameplay state
@@ -175,25 +185,31 @@ class SwerveGame {
     this.shields = 3;
     this.combo = 1;
     this.peakCombo = 1;
+    this.zoneIndex = 0;
     this.elapsedRunSec = 0;
     this.tunnelScroll = 0;
     this.runCycle = 0;
+    this.lastFootSign = 1;
     this.readyTimer = 0;
     this.invulnTimer = 0;
+    this.hitStopTimer = 0;
     this.shakeTime = 0;
     this.shakeMag = 0;
     this.damageFlash = 0;
+    this.beatTimer = 0;
+    this.beatStep = 0;
+    this.scorePopTimer = null;
     this.stats = { dodges: 0, closeCalls: 0, rings: 0 };
 
-    // Player core state (wx in [-0.84, 0.84], wy moves from upright to ducked)
+    // Player core state
     this.player = {
-      x: 0.5, // normalized 0..1 across playable width
+      x: 0.5,
       targetX: 0.5,
       vx: 0,
       isDucked: false,
       wasDucked: false,
       duckStartTime: 0,
-      duckAnim: 0, // 0..1 smooth vertical crouch
+      duckAnim: 0,
       trail: [],
     };
 
@@ -201,11 +217,14 @@ class SwerveGame {
     this.keys = { left: false, right: false, duck: false };
     this.pointer = { active: false, id: null, x: 0, y: 0, ducking: false };
 
-    // 3D Entities
+    // 3D Entities & VFX Pools
     this.obstacles = [];
     this.rings = [];
     this.particles = [];
+    this.shockwaves = [];
     this.callouts = [];
+    this.zoneBanner = null;
+    this.warpStreaks = this._createWarpStreaks();
     this.spawnTimer = 0.6;
     this.lastPattern = null;
     this.samePatternStreak = 0;
@@ -753,24 +772,67 @@ class SwerveGame {
     }
   }
 
+  _getCurrentZone() {
+    return ZONES[this.zoneIndex % ZONES.length];
+  }
+
+  _createWarpStreaks() {
+    const streaks = [];
+    for (let i = 0; i < 26; i++) {
+      streaks.push(this._makeWarpStreak(Math.random() * SPAWN_Z));
+    }
+    return streaks;
+  }
+
+  _makeWarpStreak(z = SPAWN_Z) {
+    // Distribute streaks along the left wall, right wall, and ceiling perimeter
+    const edge = Math.random();
+    let wx;
+    let wy;
+    if (edge < 0.42) {
+      wx = -0.96 - Math.random() * 0.08;
+      wy = -0.9 + Math.random() * 1.8;
+    } else if (edge < 0.84) {
+      wx = 0.96 + Math.random() * 0.08;
+      wy = -0.9 + Math.random() * 1.8;
+    } else {
+      wx = -0.9 + Math.random() * 1.8;
+      wy = -0.98 - Math.random() * 0.06;
+    }
+    return {
+      wx,
+      wy,
+      z,
+      speedMult: 0.75 + Math.random() * 0.65,
+      len: 0.08 + Math.random() * 0.11,
+      bright: Math.random() > 0.45,
+    };
+  }
+
   beginRun() {
     this.score = 0;
     this.shields = 3;
     this.combo = 1;
     this.peakCombo = 1;
+    this.zoneIndex = 0;
     this.elapsedRunSec = 0;
     this.tunnelScroll = 0;
     this.readyTimer = 0.6;
     this.invulnTimer = 0;
+    this.hitStopTimer = 0;
     this.shakeTime = 0;
     this.shakeMag = 0;
     this.damageFlash = 0;
+    this.beatTimer = 0;
+    this.beatStep = 0;
     this.stats = { dodges: 0, closeCalls: 0, rings: 0 };
 
     this.obstacles = [];
     this.rings = [];
     this.particles = [];
+    this.shockwaves = [];
     this.callouts = [];
+    this.zoneBanner = null;
     this.spawnTimer = 0.55;
     this.lastPattern = null;
     this.samePatternStreak = 0;
@@ -783,9 +845,10 @@ class SwerveGame {
     this.player.duckAnim = 0;
     this.player.trail = [];
 
-    this._syncScoreHUD();
+    this._syncScoreHUD(false);
     this._syncShieldsHUD();
     this._syncComboHUD();
+    this._syncZoneHUD();
     this._showScreen('ready');
 
     if (this.controlMode === 'practice') {
@@ -805,6 +868,22 @@ class SwerveGame {
       this._syncHighScoreUI();
     }
 
+    // Compute arcade rank stamp
+    let rank = 'C';
+    let rankClass = 'rank-c';
+    if (this.score >= 2400 || this.stats.dodges >= 30) {
+      rank = 'S';
+      rankClass = 'rank-s';
+    } else if (this.score >= 1100 || this.stats.dodges >= 16) {
+      rank = 'A';
+      rankClass = 'rank-a';
+    } else if (this.score >= 400 || this.stats.dodges >= 7) {
+      rank = 'B';
+      rankClass = 'rank-b';
+    }
+    this.gameoverRank.textContent = rank;
+    this.gameoverRank.className = `rank-badge ${rankClass}`;
+
     this.gameoverNewBest.classList.toggle('hidden', !isNewBest);
     this.gameoverScore.textContent = this.score.toLocaleString();
     this.gameoverBest.textContent = `BEST ${this.highScore.toLocaleString()}`;
@@ -817,10 +896,17 @@ class SwerveGame {
     this._showScreen('gameover');
   }
 
-  _syncScoreHUD() {
+  _syncScoreHUD(animatePop = true) {
     this.scoreValueEl.textContent = this.score.toLocaleString();
     if (this.score > this.highScore) {
       this.bestInlineEl.textContent = `BEST ${this.score.toLocaleString()}`;
+    }
+    if (animatePop && this.score > 0) {
+      this.scoreValueEl.classList.add('pop');
+      if (this.scorePopTimer) clearTimeout(this.scorePopTimer);
+      this.scorePopTimer = setTimeout(() => {
+        this.scoreValueEl.classList.remove('pop');
+      }, 130);
     }
   }
 
@@ -835,9 +921,18 @@ class SwerveGame {
     if (this.combo > 1) {
       this.comboPillEl.textContent = `×${this.combo}`;
       this.comboPillEl.classList.remove('hidden');
+      this.comboPillEl.classList.toggle('fever', this.combo >= 4);
     } else {
       this.comboPillEl.classList.add('hidden');
+      this.comboPillEl.classList.remove('fever');
     }
+  }
+
+  _syncZoneHUD() {
+    const z = this._getCurrentZone();
+    this.zonePillEl.textContent = z.tag;
+    this.zonePillEl.style.color = z.accent;
+    this.zonePillEl.style.borderColor = `rgba(${z.rgb}, 0.42)`;
   }
 
   // ==================== 3D PERSPECTIVE PROJECTION ====================
@@ -1009,31 +1104,56 @@ class SwerveGame {
 
   _spawnParticles(x, y, color, count = 14, speedScale = 1) {
     for (let i = 0; i < count; i++) {
-      const angle = (Math.PI * 2 * i) / count + (Math.random() - 0.5) * 0.45;
-      const speed = (75 + Math.random() * 195) * speedScale;
+      if (this.particles.length >= 96) this.particles.shift();
+      const angle = (Math.PI * 2 * i) / count + (Math.random() - 0.5) * 0.5;
+      const speed = (85 + Math.random() * 230) * speedScale;
       this.particles.push({
         x,
         y,
         vx: Math.cos(angle) * speed,
         vy: Math.sin(angle) * speed,
-        size: 2.5 + Math.random() * 4,
+        size: 2.2 + Math.random() * 3.4,
         color,
-        life: 0.32 + Math.random() * 0.25,
-        maxLife: 0.57,
+        life: 0.3 + Math.random() * 0.28,
+        maxLife: 0.58,
       });
     }
   }
 
+  _spawnShockwave(x, y, color, maxRadius = 96, lineWidth = 4) {
+    if (this.shockwaves.length >= 10) this.shockwaves.shift();
+    this.shockwaves.push({
+      x,
+      y,
+      color,
+      radius: 10,
+      maxRadius,
+      lineWidth,
+      life: 0.34,
+      maxLife: 0.34,
+    });
+  }
+
   _addCallout(x, y, text, color = COLORS.volt, size = 16) {
     this.callouts.push({
-      x: clamp(x, this.playLeft + 54, this.playRight - 54),
+      x: clamp(x, this.playLeft + 58, this.playRight - 58),
       y,
       text,
       color,
       size,
-      life: 0.85,
-      maxLife: 0.85,
+      life: 0.9,
+      maxLife: 0.9,
     });
+  }
+
+  _updateWarpStreaks(dtSec, speedFactor) {
+    for (let i = 0; i < this.warpStreaks.length; i++) {
+      const st = this.warpStreaks[i];
+      st.z -= dtSec * speedFactor * st.speedMult;
+      if (st.z < -0.15) {
+        this.warpStreaks[i] = this._makeWarpStreak(SPAWN_Z + Math.random() * 0.15);
+      }
+    }
   }
 
   _loop(nowMs) {
@@ -1051,18 +1171,30 @@ class SwerveGame {
       this.poseState = this.tracker.update(nowMs, dtSec, this.viewW, this.viewH);
     }
 
-    // Gentle tunnel drift on start / ready screens
-    if (this.state === 'start' || this.state === 'ready') {
-      this.tunnelScroll = (this.tunnelScroll + dtSec * 0.35) % 1;
-      this.runCycle += dtSec * 7.5;
+    // Live animated 3D runway + sprinting demo runner on the Start screen
+    if (this.state === 'start') {
+      this.tunnelScroll = (this.tunnelScroll + dtSec * 0.42) % 1;
+      this.runCycle += dtSec * 8.4;
+      this._updateWarpStreaks(dtSec, 0.62);
+      const demoX = 0.5 + Math.sin(nowMs * 0.0013) * 0.22;
+      this.player.vx = (demoX - this.player.x) / Math.max(0.016, dtSec);
+      this.player.x = demoX;
+      this.player.duckAnim = 0;
+      this.player.isDucked = false;
+      return;
     }
 
     if (this.state === 'calibrating') {
+      this.tunnelScroll = (this.tunnelScroll + dtSec * 0.22) % 1;
+      this._updateWarpStreaks(dtSec, 0.35);
       this._updateCalibrationUI();
       return;
     }
 
     if (this.state === 'ready') {
+      this.tunnelScroll = (this.tunnelScroll + dtSec * 0.45) % 1;
+      this.runCycle += dtSec * 9.0;
+      this._updateWarpStreaks(dtSec, 0.7);
       this._updatePlayerControl(nowMs, dtSec);
       this.readyTimer -= dtSec;
       if (this.readyTimer <= 0) {
@@ -1075,10 +1207,46 @@ class SwerveGame {
       return;
     }
 
+    // Hit-stop micro-freeze for visceral impact feel
+    if (this.hitStopTimer > 0) {
+      this.hitStopTimer = Math.max(0, this.hitStopTimer - dtSec);
+      if (this.shakeTime > 0) this.shakeTime = Math.max(0, this.shakeTime - dtSec);
+      return;
+    }
+
     this.elapsedRunSec += dtSec;
+
+    // Progressive Zone transitions (every ~24 seconds)
+    const nextZone = Math.min(ZONES.length - 1, Math.floor(this.elapsedRunSec / 24));
+    if (nextZone > this.zoneIndex) {
+      this.zoneIndex = nextZone;
+      const z = this._getCurrentZone();
+      this._syncZoneHUD();
+      this.zoneBanner = {
+        tag: `ZONE ${nextZone + 1}`,
+        name: z.name,
+        color: z.accent,
+        life: 1.7,
+        maxLife: 1.7,
+      };
+      this.audio.zoneUp();
+      this._spawnShockwave(this.viewW * 0.5, this.viewH * 0.4, z.accent, Math.max(this.viewW, this.viewH) * 0.55, 5);
+    }
+
     const diff = this._getDifficulty();
-    this.tunnelScroll = (this.tunnelScroll + dtSec * diff.zSpeed * 0.72) % 1;
-    this.runCycle += dtSec * (9.5 + diff.t * 4.5);
+    const feverBoost = this.combo >= 4 ? 1.24 : 1.0;
+    this.tunnelScroll = (this.tunnelScroll + dtSec * diff.zSpeed * 0.78 * feverBoost) % 1;
+    this.runCycle += dtSec * (9.8 + diff.t * 4.8);
+    this._updateWarpStreaks(dtSec, diff.zSpeed * 1.35 * feverBoost);
+
+    // Rhythmic arcade synth bass pulse synced to tunnel tempo
+    const beatInterval = clamp(0.46 - diff.t * 0.14, 0.3, 0.46);
+    this.beatTimer += dtSec;
+    if (this.beatTimer >= beatInterval) {
+      this.beatTimer -= beatInterval;
+      this.audio.beatPulse(this.zoneIndex, this.combo, this.beatStep % 2 === 0);
+      this.beatStep += 1;
+    }
 
     if (this.controlMode === 'practice' && this.elapsedRunSec > 6.5) {
       this.practiceHintEl.style.opacity = '0';
@@ -1153,6 +1321,31 @@ class SwerveGame {
     this.player.duckAnim += (duckTarget - this.player.duckAnim) * (1 - Math.exp(-dtSec / 0.055));
 
     const pm = this._getPlayerMetrics();
+
+    // Subtle kinetic footstep sparks off the 3D tunnel runway
+    if (this.state === 'playing' && !this.player.isDucked) {
+      const footSign = Math.sin(this.runCycle) >= 0 ? 1 : -1;
+      if (footSign !== this.lastFootSign) {
+        this.lastFootSign = footSign;
+        const zone = this._getCurrentZone();
+        const sparkColor = this.combo >= 4 ? COLORS.cyan : zone.accent;
+        for (let k = 0; k < 2; k++) {
+          if (this.particles.length < 96) {
+            this.particles.push({
+              x: pm.floorX + footSign * 9 + (Math.random() - 0.5) * 6,
+              y: pm.floorY - 2,
+              vx: footSign * (18 + Math.random() * 34) - this.player.vx * 35,
+              vy: -(24 + Math.random() * 42),
+              size: 1.8 + Math.random() * 1.6,
+              color: sparkColor,
+              life: 0.22,
+              maxLife: 0.22,
+            });
+          }
+        }
+      }
+    }
+
     this.player.trail.unshift({
       x: pm.x,
       y: pm.y,
@@ -1160,7 +1353,7 @@ class SwerveGame {
       floorY: pm.floorY,
       duck: this.player.duckAnim,
     });
-    if (this.player.trail.length > 5) {
+    if (this.player.trail.length > 6) {
       this.player.trail.pop();
     }
   }
@@ -1173,7 +1366,11 @@ class SwerveGame {
       this.shakeTime = Math.max(0, this.shakeTime - dtSec);
     }
     if (this.damageFlash > 0) {
-      this.damageFlash = Math.max(0, this.damageFlash - dtSec * 1.8);
+      this.damageFlash = Math.max(0, this.damageFlash - dtSec * 1.9);
+    }
+    if (this.zoneBanner) {
+      this.zoneBanner.life -= dtSec;
+      if (this.zoneBanner.life <= 0) this.zoneBanner = null;
     }
 
     this.spawnTimer -= dtSec;
@@ -1201,7 +1398,6 @@ class SwerveGame {
       const zFront = obs.z;
       const zBack = obs.z + obs.depth;
 
-      // Player sits at z = 0 plane
       const overlapsZ = zFront <= 0.025 && zBack >= -0.025;
 
       if (overlapsZ && !obs.hit) {
@@ -1246,16 +1442,27 @@ class SwerveGame {
           this.score += pts;
           this.stats.closeCalls += 1;
           this.audio.closeCall(this.combo);
-          this._spawnParticles(pm.x, pm.y - 8, COLORS.amber, 12, 0.9);
-          this._addCallout(pm.x, pm.y - 34, `CLOSE! +${pts}`, COLORS.amber, 17);
+          this._spawnParticles(pm.x, pm.y - 10, COLORS.amber, 16, 1.05);
+          this._spawnShockwave(pm.x, pm.y, COLORS.amber, 92, 3.5);
+          this._addCallout(pm.x, pm.y - 38, `CLOSE! +${pts}`, COLORS.amber, 18);
         } else {
           const pts = 20 * this.combo;
           this.score += pts;
           this.audio.dodge(this.combo);
-          this._addCallout(pm.x, pm.y - 28, `+${pts}`, COLORS.volt, 14);
+          const streakLabel =
+            this.combo === 4
+              ? `FEVER ×4! +${pts}`
+              : this.combo === 8
+                ? `UNSTOPPABLE! +${pts}`
+                : `+${pts}`;
+          const col = this.combo >= 4 ? COLORS.cyan : COLORS.volt;
+          this._addCallout(pm.x, pm.y - 30, streakLabel, col, this.combo >= 4 ? 16 : 14);
+          if (this.combo === 4 || this.combo === 8) {
+            this._spawnShockwave(pm.x, pm.y, COLORS.cyan, 110, 3.5);
+          }
         }
 
-        this._syncScoreHUD();
+        this._syncScoreHUD(true);
         this._syncComboHUD();
       }
 
@@ -1277,7 +1484,7 @@ class SwerveGame {
       }
 
       ring.z -= ring.zSpeed * dtSec;
-      ring.spin += dtSec * 4.2;
+      ring.spin += dtSec * 4.5;
 
       if (!ring.collected && Math.abs(ring.z) <= 0.085) {
         const dx = Math.abs(ring.wx - pm.wx);
@@ -1289,9 +1496,10 @@ class SwerveGame {
           this.stats.rings += 1;
           const rp = this._project(ring.wx, ring.wy, Math.max(0, ring.z), pm.cam);
           this.audio.goldRing(this.combo);
-          this._spawnParticles(rp.x, rp.y, COLORS.amber, 16, 1.05);
-          this._addCallout(rp.x, rp.y - 24, `RING +${pts}`, COLORS.amber, 16);
-          this._syncScoreHUD();
+          this._spawnParticles(rp.x, rp.y, COLORS.amber, 20, 1.15);
+          this._spawnShockwave(rp.x, rp.y, COLORS.amber, 86, 4);
+          this._addCallout(rp.x, rp.y - 26, `RING +${pts}`, COLORS.amber, 17);
+          this._syncScoreHUD(true);
           this.rings.splice(i, 1);
           continue;
         }
@@ -1302,16 +1510,27 @@ class SwerveGame {
       }
     }
 
-    // Update particles
+    // Update spark particles
     for (let i = this.particles.length - 1; i >= 0; i--) {
       const pt = this.particles[i];
       pt.life -= dtSec;
       pt.x += pt.vx * dtSec;
       pt.y += pt.vy * dtSec;
-      pt.vx *= 0.94;
-      pt.vy *= 0.94;
+      pt.vx *= 0.93;
+      pt.vy *= 0.93;
       if (pt.life <= 0) {
         this.particles.splice(i, 1);
+      }
+    }
+
+    // Update shockwaves
+    for (let i = this.shockwaves.length - 1; i >= 0; i--) {
+      const sw = this.shockwaves[i];
+      sw.life -= dtSec;
+      const p = 1 - clamp(sw.life / sw.maxLife, 0, 1);
+      sw.radius = 10 + (sw.maxRadius - 10) * (1 - Math.pow(1 - p, 3));
+      if (sw.life <= 0) {
+        this.shockwaves.splice(i, 1);
       }
     }
 
@@ -1319,7 +1538,7 @@ class SwerveGame {
     for (let i = this.callouts.length - 1; i >= 0; i--) {
       const c = this.callouts[i];
       c.life -= dtSec;
-      c.y -= 48 * dtSec;
+      c.y -= 52 * dtSec;
       if (c.life <= 0) {
         this.callouts.splice(i, 1);
       }
@@ -1333,14 +1552,16 @@ class SwerveGame {
     this.shields -= 1;
     this.combo = 1;
     this.invulnTimer = 1.4;
-    this.shakeTime = 0.28;
-    this.shakeMag = 14;
-    this.damageFlash = 0.44;
+    this.hitStopTimer = 0.048;
+    this.shakeTime = 0.32;
+    this.shakeMag = 16;
+    this.damageFlash = 0.52;
 
     this._syncShieldsHUD();
     this._syncComboHUD();
-    this._spawnParticles(pm.x, pm.y, COLORS.vermilion, 22, 1.3);
-    this._addCallout(pm.x, pm.y - 32, 'SHIELD HIT', COLORS.vermilion, 16);
+    this._spawnParticles(pm.x, pm.y, COLORS.vermilion, 26, 1.4);
+    this._spawnShockwave(pm.x, pm.y, COLORS.vermilion, 130, 5);
+    this._addCallout(pm.x, pm.y - 34, 'SHIELD HIT!', COLORS.vermilion, 18);
     this.audio.hit();
 
     if (this.shields <= 0) {
@@ -1357,7 +1578,7 @@ class SwerveGame {
     ctx.save();
 
     if (this.shakeTime > 0) {
-      const decay = this.shakeTime / 0.28;
+      const decay = this.shakeTime / 0.32;
       const sx = (Math.random() * 2 - 1) * this.shakeMag * decay;
       const sy = (Math.random() * 2 - 1) * this.shakeMag * decay;
       ctx.translate(sx, sy);
@@ -1365,10 +1586,17 @@ class SwerveGame {
 
     const cam = this._getCorridorCamera();
 
-    // 1. 3D Perspective Studio Corridor
-    this._draw3DTunnel(ctx, cam);
+    // 1. Illuminated 3D Perspective Tunnel, Reflective Runway & Velocity Warp Streaks
+    this._draw3DTunnel(ctx, cam, nowMs);
 
-    // 2. Subtle Pose Skeleton & Duck Clearance Line (camera mode)
+    // 2. Live Sprinting Runner Showcase on the Start Screen
+    if (this.state === 'start') {
+      this._drawPlayerBody(ctx, nowMs);
+      ctx.restore();
+      return;
+    }
+
+    // 3. Subtle Pose Skeleton & Duck Clearance Line (camera mode)
     if (
       this.controlMode === 'camera' &&
       this.tracker.cameraActive &&
@@ -1377,12 +1605,12 @@ class SwerveGame {
       this._drawPoseOverlay(ctx, nowMs);
     }
 
-    // 3. Practice mode duck zone hint while dragging
+    // 4. Practice mode duck zone hint while dragging
     if (this.controlMode === 'practice' && (this.state === 'playing' || this.state === 'ready')) {
       this._drawPracticeDuckZone(ctx);
     }
 
-    // 4. 3D Telegraphs & Painter-Sorted Obstacles, Gold Rings, and Runner Body
+    // 5. 3D Telegraphs, Painter-Sorted Obstacles / Gold Rings / Runner, and Kinetic VFX
     if (
       this.state === 'playing' ||
       this.state === 'ready' ||
@@ -1391,8 +1619,11 @@ class SwerveGame {
     ) {
       this._drawTelegraphs(ctx, cam, nowMs);
       this._draw3DEntitiesSorted(ctx, cam, nowMs);
+      this._drawShockwaves(ctx);
       this._drawParticles(ctx);
+      this._drawSpeedLines(ctx, nowMs);
       this._drawCallouts(ctx);
+      this._drawZoneBanner(ctx);
     }
 
     if (this.state === 'ready') {
@@ -1400,41 +1631,106 @@ class SwerveGame {
     }
 
     if (this.damageFlash > 0) {
-      ctx.fillStyle = `rgba(255, 77, 46, ${(this.damageFlash * 0.42).toFixed(3)})`;
+      const grad = ctx.createRadialGradient(
+        this.viewW * 0.5,
+        this.viewH * 0.5,
+        this.viewW * 0.18,
+        this.viewW * 0.5,
+        this.viewH * 0.5,
+        Math.max(this.viewW, this.viewH) * 0.72
+      );
+      grad.addColorStop(0, `rgba(255, 77, 46, ${(this.damageFlash * 0.12).toFixed(3)})`);
+      grad.addColorStop(1, `rgba(255, 42, 24, ${(this.damageFlash * 0.65).toFixed(3)})`);
+      ctx.fillStyle = grad;
       ctx.fillRect(0, 0, this.viewW, this.viewH);
     }
 
     ctx.restore();
   }
 
-  _draw3DTunnel(ctx, cam) {
+  _draw3DTunnel(ctx, cam, nowMs) {
     ctx.save();
 
+    const zone = this._getCurrentZone();
+    const isFever = this.combo >= 4 && this.state === 'playing';
+    const railRgb = isFever ? '50, 230, 255' : zone.rgb;
     const farZ = SPAWN_Z;
     const nearZ = 0;
 
-    // 4 perspective corner rails from distant portal to near plane
-    const corners = [
-      [-1, -1],
-      [1, -1],
-      [1, 1],
-      [-1, 1],
-    ];
+    // 1. Atmospheric Radial Portal Glow at Vanishing Horizon
+    const fTL = this._project(-1, -1, farZ, cam);
+    const fBR = this._project(1, 1, farZ, cam);
+    const fCx = (fTL.x + fBR.x) * 0.5;
+    const fCy = (fTL.y + fBR.y) * 0.5;
+    const portalRadius = Math.max(fBR.x - fTL.x, fBR.y - fTL.y) * 1.9;
 
-    ctx.strokeStyle = 'rgba(255, 255, 255, 0.14)';
-    ctx.lineWidth = 1.25;
-    for (const [wx, wy] of corners) {
+    const portalGrad = ctx.createRadialGradient(fCx, fCy, 6, fCx, fCy, portalRadius);
+    portalGrad.addColorStop(0, `rgba(${railRgb}, ${isFever ? 0.34 : 0.22})`);
+    portalGrad.addColorStop(0.42, `rgba(${zone.secondary}, 0.09)`);
+    portalGrad.addColorStop(1, 'rgba(7, 9, 12, 0)');
+    ctx.fillStyle = portalGrad;
+    ctx.beginPath();
+    ctx.arc(fCx, fCy, portalRadius, 0, Math.PI * 2);
+    ctx.fill();
+
+    // 2. Reflective 3D Studio Runway Floor Surface (wy = +1)
+    const flFar = this._project(-1, 1, farZ, cam);
+    const frFar = this._project(1, 1, farZ, cam);
+    const frNear = this._project(1, 1, nearZ, cam);
+    const flNear = this._project(-1, 1, nearZ, cam);
+
+    const floorGrad = ctx.createLinearGradient(0, flFar.y, 0, flNear.y);
+    floorGrad.addColorStop(0, `rgba(${railRgb}, 0.14)`);
+    floorGrad.addColorStop(0.45, 'rgba(10, 14, 20, 0.36)');
+    floorGrad.addColorStop(1, 'rgba(7, 9, 12, 0.62)');
+    ctx.fillStyle = floorGrad;
+    ctx.beginPath();
+    ctx.moveTo(flFar.x, flFar.y);
+    ctx.lineTo(frFar.x, frFar.y);
+    ctx.lineTo(frNear.x, frNear.y);
+    ctx.lineTo(flNear.x, flNear.y);
+    ctx.closePath();
+    ctx.fill();
+
+    // 3. 4 Perspective Corner Rails (ceiling subtle, floor curbs glowing)
+    const corners = [
+      [-1, -1, false],
+      [1, -1, false],
+      [1, 1, true],
+      [-1, 1, true],
+    ];
+    for (const [wx, wy, isFloor] of corners) {
       const pFar = this._project(wx, wy, farZ, cam);
       const pNear = this._project(wx, wy, nearZ, cam);
-      ctx.beginPath();
-      ctx.moveTo(pFar.x, pFar.y);
-      ctx.lineTo(pNear.x, pNear.y);
-      ctx.stroke();
+      if (isFloor) {
+        // Outer glow curb
+        ctx.strokeStyle = `rgba(${railRgb}, 0.26)`;
+        ctx.lineWidth = 5;
+        ctx.beginPath();
+        ctx.moveTo(pFar.x, pFar.y);
+        ctx.lineTo(pNear.x, pNear.y);
+        ctx.stroke();
+
+        // Sharp inner neon rail
+        ctx.strokeStyle = `rgba(${railRgb}, 0.78)`;
+        ctx.lineWidth = 1.8;
+        ctx.beginPath();
+        ctx.moveTo(pFar.x, pFar.y);
+        ctx.lineTo(pNear.x, pNear.y);
+        ctx.stroke();
+      } else {
+        ctx.strokeStyle = `rgba(${railRgb}, 0.18)`;
+        ctx.lineWidth = 1.25;
+        ctx.beginPath();
+        ctx.moveTo(pFar.x, pFar.y);
+        ctx.lineTo(pNear.x, pNear.y);
+        ctx.stroke();
+      }
     }
 
-    // Subtle floor lane guide lines (left/center/right cues receding into depth)
-    ctx.strokeStyle = 'rgba(255, 255, 255, 0.08)';
-    ctx.lineWidth = 1;
+    // 4. Illuminated Floor Lane Dividers
+    ctx.strokeStyle = `rgba(${railRgb}, 0.16)`;
+    ctx.lineWidth = 1.1;
     for (const laneWx of [-0.36, 0.36]) {
       const pFar = this._project(laneWx, 1, farZ, cam);
       const pNear = this._project(laneWx, 1, nearZ, cam);
@@ -1444,8 +1740,8 @@ class SwerveGame {
       ctx.stroke();
     }
 
-    // Speeding depth portal rings rushing toward camera
-    const frameCount = 5;
+    // 5. Scrolling Runway Chevrons & Speeding 3D Tunnel Ribs
+    const frameCount = 6;
     for (let i = 0; i < frameCount; i++) {
       let z = ((i / frameCount) - this.tunnelScroll + 1) % 1;
       z = z * (SPAWN_Z + 0.08) - 0.08;
@@ -1455,26 +1751,64 @@ class SwerveGame {
       const br = this._project(1, 1, z, cam);
       const depthAlpha = clamp(1 - z / SPAWN_Z, 0.08, 1) * (z < 0 ? clamp(1 + z * 8, 0, 1) : 1);
 
-      ctx.strokeStyle = `rgba(255, 255, 255, ${(0.05 + depthAlpha * 0.12).toFixed(3)})`;
-      ctx.lineWidth = 1 + depthAlpha * 0.7;
+      // Subtle glowing depth frame rib
+      ctx.strokeStyle = `rgba(${railRgb}, ${(0.06 + depthAlpha * 0.18).toFixed(3)})`;
+      ctx.lineWidth = 1 + depthAlpha * 0.9;
       ctx.strokeRect(tl.x, tl.y, br.x - tl.x, br.y - tl.y);
+
+      // Forward-pointing glowing runway chevron along center track
+      const zTip = Math.max(-0.04, z - 0.045);
+      const cL = this._project(-0.22, 1, z, cam);
+      const cTip = this._project(0, 1, zTip, cam);
+      const cR = this._project(0.22, 1, z, cam);
+      ctx.strokeStyle = `rgba(${railRgb}, ${(0.1 + depthAlpha * 0.34).toFixed(3)})`;
+      ctx.lineWidth = 1.4 + depthAlpha * 1.4;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      ctx.beginPath();
+      ctx.moveTo(cL.x, cL.y);
+      ctx.lineTo(cTip.x, cTip.y);
+      ctx.lineTo(cR.x, cR.y);
+      ctx.stroke();
     }
 
-    // Crisp far vanishing portal rectangle
-    const fTL = this._project(-1, -1, farZ, cam);
-    const fBR = this._project(1, 1, farZ, cam);
-    ctx.fillStyle = 'rgba(12, 14, 16, 0.32)';
+    // 6. Far Vanishing Portal Frame + Rotating Energy Ring
+    ctx.fillStyle = 'rgba(7, 9, 12, 0.42)';
     ctx.fillRect(fTL.x, fTL.y, fBR.x - fTL.x, fBR.y - fTL.y);
-    ctx.strokeStyle = 'rgba(255, 255, 255, 0.22)';
-    ctx.lineWidth = 1.4;
+    ctx.strokeStyle = `rgba(${railRgb}, 0.48)`;
+    ctx.lineWidth = 1.6;
     ctx.strokeRect(fTL.x, fTL.y, fBR.x - fTL.x, fBR.y - fTL.y);
 
-    // Subtle near player-plane horizon frame
-    const nTL = this._project(-1, -1, 0, cam);
-    const nBR = this._project(1, 1, 0, cam);
-    ctx.strokeStyle = 'rgba(200, 245, 59, 0.1)';
-    ctx.lineWidth = 1;
-    ctx.strokeRect(nTL.x, nTL.y, nBR.x - nTL.x, nBR.y - nTL.y);
+    const spinR = Math.min(fBR.x - fTL.x, fBR.y - fTL.y) * 0.34;
+    const rot = nowMs * (isFever ? 0.0028 : 0.0014);
+    ctx.strokeStyle = `rgba(${railRgb}, 0.42)`;
+    ctx.lineWidth = 1.8;
+    for (let a = 0; a < 3; a++) {
+      const start = rot + (a * Math.PI * 2) / 3;
+      ctx.beginPath();
+      ctx.arc(fCx, fCy, spinR, start, start + Math.PI * 0.38);
+      ctx.stroke();
+    }
+
+    // 7. High-Speed 3D Velocity Warp Streaks (additive blend for arcade glow)
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.lineCap = 'round';
+    for (const st of this.warpStreaks) {
+      const zHead = st.z;
+      const zTail = Math.min(SPAWN_Z, st.z + st.len * (isFever ? 1.55 : 1));
+      if (zHead > SPAWN_Z) continue;
+      const p1 = this._project(st.wx, st.wy, zHead, cam);
+      const p2 = this._project(st.wx, st.wy, zTail, cam);
+      const a = clamp(1 - zHead / SPAWN_Z, 0.05, 0.85) * (st.bright ? 0.65 : 0.35);
+      ctx.strokeStyle = st.bright ? `rgba(${railRgb}, ${a.toFixed(3)})` : `rgba(244, 247, 250, ${(a * 0.7).toFixed(3)})`;
+      ctx.lineWidth = Math.max(1, 2.2 * p1.s);
+      ctx.beginPath();
+      ctx.moveTo(p2.x, p2.y);
+      ctx.lineTo(p1.x, p1.y);
+      ctx.stroke();
+    }
+    ctx.restore();
 
     ctx.restore();
   }
@@ -1487,27 +1821,27 @@ class SwerveGame {
       if (obs.state !== 'telegraph') continue;
 
       const progress = clamp(obs.telegraphTimer / obs.telegraphDuration, 0, 1);
-      const pulse = 0.55 + Math.sin(nowMs * 0.026) * 0.35;
+      const pulse = 0.55 + Math.sin(nowMs * 0.028) * 0.35;
       const isBeam = obs.type === 'lowBeam';
       const isSafeBeam = isBeam && this.player.isDucked;
       const accent = isSafeBeam ? COLORS.volt : COLORS.vermilion;
 
       ctx.save();
 
-      // 1. 3D Distant Portal Preview showing exact upcoming 3D obstacle silhouette
+      // 1. Glowing 3D Portal Preview showing exact upcoming obstacle silhouette
       const pTL = this._project(obs.wx1, obs.wy1, SPAWN_Z, cam);
       const pBR = this._project(obs.wx2, obs.wy2, SPAWN_Z, cam);
       const pw = pBR.x - pTL.x;
       const ph = pBR.y - pTL.y;
 
       ctx.fillStyle = isSafeBeam
-        ? `rgba(200, 245, 59, ${(0.18 + progress * 0.28).toFixed(3)})`
-        : `rgba(255, 77, 46, ${(0.22 + progress * 0.36).toFixed(3)})`;
+        ? `rgba(200, 245, 59, ${(0.22 + progress * 0.34).toFixed(3)})`
+        : `rgba(255, 77, 46, ${(0.28 + progress * 0.42).toFixed(3)})`;
       ctx.fillRect(pTL.x, pTL.y, pw, ph);
 
       ctx.strokeStyle = accent;
-      ctx.lineWidth = 2;
-      ctx.globalAlpha = 0.65 + progress * 0.35;
+      ctx.lineWidth = 2.2;
+      ctx.globalAlpha = 0.7 + progress * 0.3;
       ctx.strokeRect(pTL.x, pTL.y, pw, ph);
 
       // 2. Compact notch-safe top-edge telegraph bar matching obstacle X span
@@ -1517,7 +1851,7 @@ class SwerveGame {
       const bw = widthNorm * this.playW - 8;
 
       ctx.globalAlpha = 1;
-      ctx.fillStyle = isSafeBeam ? 'rgba(200, 245, 59, 0.2)' : 'rgba(255, 77, 46, 0.22)';
+      ctx.fillStyle = isSafeBeam ? 'rgba(200, 245, 59, 0.2)' : 'rgba(255, 77, 46, 0.24)';
       this._roundRect(ctx, bx, topBarY, bw, 7, 4);
       ctx.fill();
 
@@ -1528,10 +1862,10 @@ class SwerveGame {
 
       if (isBeam) {
         ctx.globalAlpha = pulse;
-        ctx.font = '700 10.5px "JetBrains Mono", monospace';
+        ctx.font = '700 11px "Chakra Petch", sans-serif';
         ctx.textAlign = 'center';
         ctx.fillStyle = accent;
-        ctx.fillText(isSafeBeam ? 'LOW BEAM · CLEAR' : '▼ LOW BEAM · DUCK ▼', bx + bw * 0.5, topBarY + 20);
+        ctx.fillText(isSafeBeam ? 'LOW BEAM · CLEAR' : '▼ LASER BEAM · DUCK ▼', bx + bw * 0.5, topBarY + 21);
         ctx.textAlign = 'left';
       }
 
@@ -1540,7 +1874,6 @@ class SwerveGame {
   }
 
   _draw3DEntitiesSorted(ctx, cam, nowMs) {
-    // Painter's algorithm: sort obstacles, gold rings, and the player avatar body (z=0) back-to-front
     const items = [{ kind: 'player', z: 0.0, ref: null }];
     for (const obs of this.obstacles) {
       if (obs.state === 'active') {
@@ -1557,20 +1890,19 @@ class SwerveGame {
 
     for (const item of items) {
       if (item.kind === 'obs') {
-        this._draw3DObstacle(ctx, item.ref, cam);
+        this._draw3DObstacle(ctx, item.ref, cam, nowMs);
       } else if (item.kind === 'ring') {
-        this._draw3DRing(ctx, item.ref, cam);
+        this._draw3DRing(ctx, item.ref, cam, nowMs);
       } else {
         this._drawPlayerBody(ctx, nowMs);
       }
     }
   }
 
-  _draw3DObstacle(ctx, obs, cam) {
+  _draw3DObstacle(ctx, obs, cam, nowMs) {
     const zFront = obs.z;
     const zBack = obs.z + obs.depth;
 
-    // Fade in smoothly from distant fog and fade out right as it flies past camera
     const farFade = clamp((SPAWN_Z - zFront) * 4.5 + 0.28, 0.22, 1);
     const nearFade = zFront < -0.02 ? clamp(1 - (-0.02 - zFront) / 0.16, 0, 1) : 1;
     const alpha = farFade * nearFade;
@@ -1579,7 +1911,6 @@ class SwerveGame {
     const isBeam = obs.type === 'lowBeam';
     const isBeamCleared = isBeam && this.player.isDucked;
 
-    // Project all 8 corners of the 3D slab
     const fTL = this._project(obs.wx1, obs.wy1, zFront, cam);
     const fTR = this._project(obs.wx2, obs.wy1, zFront, cam);
     const fBR = this._project(obs.wx2, obs.wy2, zFront, cam);
@@ -1590,17 +1921,122 @@ class SwerveGame {
     const bBR = this._project(obs.wx2, obs.wy2, zBack, cam);
     const bBL = this._project(obs.wx1, obs.wy2, zBack, cam);
 
+    const fw = fTR.x - fTL.x;
+    const fh = fBL.y - fTL.y;
+
     ctx.save();
     ctx.globalAlpha = alpha;
 
-    // 1. Draw visible 3D extruded side / top / underside faces first
-    const sideFill = isBeamCleared ? 'rgba(130, 180, 32, 0.34)' : COLORS.vermilionSide;
-    const topFill = isBeamCleared ? 'rgba(165, 215, 48, 0.36)' : '#c7311a';
-    const underFill = isBeamCleared ? 'rgba(200, 245, 59, 0.26)' : COLORS.vermilionDeep;
+    // 0. Glowing 3D Floor Reflection Pool beneath approaching walls/pillars/beams
+    const flFront = this._project(obs.wx1, 1.0, zFront, cam);
+    const frFront = this._project(obs.wx2, 1.0, zFront, cam);
+    const reflectH = Math.max(8, 34 * fTL.s);
+    const reflGrad = ctx.createLinearGradient(0, flFront.y, 0, flFront.y + reflectH);
+    const reflRgb = isBeamCleared ? '200, 245, 59' : '255, 77, 46';
+    reflGrad.addColorStop(0, `rgba(${reflRgb}, ${isBeam ? 0.18 : 0.34})`);
+    reflGrad.addColorStop(1, `rgba(${reflRgb}, 0)`);
+    ctx.fillStyle = reflGrad;
+    ctx.fillRect(flFront.x, flFront.y, frFront.x - flFront.x, reflectH);
 
-    // Right inner face (visible when obstacle's right edge is left of vanishing point)
+    // Special Plasma Laser Gantry rendering for Low Beam!
+    if (isBeam) {
+      // Top bevel glass/energy sheet
+      if (fTL.y > cam.vpY) {
+        ctx.fillStyle = isBeamCleared ? 'rgba(200, 245, 59, 0.24)' : 'rgba(220, 46, 22, 0.45)';
+        ctx.beginPath();
+        ctx.moveTo(fTL.x, fTL.y);
+        ctx.lineTo(fTR.x, fTR.y);
+        ctx.lineTo(bTR.x, bTR.y);
+        ctx.lineTo(bTL.x, bTL.y);
+        ctx.closePath();
+        ctx.fill();
+      }
+
+      // Main glowing holographic / plasma barrier panel
+      const beamGrad = ctx.createLinearGradient(fTL.x, fTL.y, fTL.x, fBL.y);
+      if (isBeamCleared) {
+        beamGrad.addColorStop(0, 'rgba(200, 245, 59, 0.12)');
+        beamGrad.addColorStop(0.5, 'rgba(200, 245, 59, 0.28)');
+        beamGrad.addColorStop(1, 'rgba(50, 230, 255, 0.24)');
+      } else {
+        beamGrad.addColorStop(0, 'rgba(255, 62, 36, 0.85)');
+        beamGrad.addColorStop(0.5, 'rgba(255, 92, 48, 0.65)');
+        beamGrad.addColorStop(1, 'rgba(255, 52, 28, 0.92)');
+      }
+      ctx.fillStyle = beamGrad;
+      ctx.fillRect(fTL.x, fTL.y, fw, fh);
+
+      // Twin metallic side emitter pods mounted on the left & right tunnel walls
+      const podW = Math.max(6, 16 * fTL.s);
+      ctx.fillStyle = '#141a22';
+      ctx.strokeStyle = isBeamCleared ? COLORS.volt : '#ff8e78';
+      ctx.lineWidth = Math.max(1, 1.8 * fTL.s);
+      ctx.fillRect(fTL.x, fTL.y, podW, fh);
+      ctx.strokeRect(fTL.x, fTL.y, podW, fh);
+      ctx.fillRect(fTR.x - podW, fTL.y, podW, fh);
+      ctx.strokeRect(fTR.x - podW, fTL.y, podW, fh);
+
+      // Additive multi-layered plasma laser lines pulsing across the beam
+      ctx.save();
+      ctx.globalCompositeOperation = 'lighter';
+      const wave = Math.sin(nowMs * 0.02 + zFront * 12) * 3 * fTL.s;
+      const midY = fTL.y + fh * 0.5;
+      const plasmaColor = isBeamCleared ? 'rgba(200, 245, 59, 0.7)' : 'rgba(255, 110, 74, 0.85)';
+
+      ctx.strokeStyle = plasmaColor;
+      ctx.lineWidth = Math.max(3, 9 * fTL.s);
+      ctx.beginPath();
+      ctx.moveTo(fTL.x + podW, midY);
+      ctx.quadraticCurveTo(fTL.x + fw * 0.5, midY + wave, fTR.x - podW, midY);
+      ctx.stroke();
+
+      ctx.strokeStyle = isBeamCleared ? '#f4ffbf' : '#fff2ec';
+      ctx.lineWidth = Math.max(1.2, 2.8 * fTL.s);
+      ctx.beginPath();
+      ctx.moveTo(fTL.x + podW, midY);
+      ctx.quadraticCurveTo(fTL.x + fw * 0.5, midY + wave, fTR.x - podW, midY);
+      ctx.stroke();
+
+      // Bright bottom clearance laser lip
+      ctx.fillStyle = isBeamCleared ? COLORS.volt : '#ffd4c7';
+      ctx.fillRect(fBL.x, fBL.y - Math.max(2, 4 * fTL.s), fw, Math.max(2, 4 * fTL.s));
+      ctx.restore();
+
+      // Crisp border & centered status badge
+      ctx.strokeStyle = isBeamCleared ? COLORS.volt : '#ff8a70';
+      ctx.lineWidth = Math.max(1.2, 2.2 * fTL.s);
+      ctx.strokeRect(fTL.x, fTL.y, fw, fh);
+
+      if (fw > 92) {
+        const fontSize = clamp(Math.round(13.5 * fTL.s), 9, 15);
+        const badgeText = isBeamCleared ? 'CLEAR ✓' : 'DUCK UNDER';
+        ctx.font = `700 ${fontSize}px "Chakra Petch", sans-serif`;
+        const tw = ctx.measureText(badgeText).width;
+        const bw = tw + 18;
+        const bh = fontSize + 10;
+        const bx = fBL.x + (fw - bw) * 0.5;
+        const by = fBL.y - bh - Math.max(6, 10 * fTL.s);
+
+        ctx.fillStyle = isBeamCleared ? COLORS.volt : 'rgba(9, 12, 16, 0.9)';
+        this._roundRect(ctx, bx, by, bw, bh, 5);
+        ctx.fill();
+        ctx.fillStyle = isBeamCleared ? '#090c04' : '#ffffff';
+        ctx.textAlign = 'center';
+        ctx.fillText(badgeText, fBL.x + fw * 0.5, by + bh - 6);
+        ctx.textAlign = 'left';
+      }
+
+      ctx.restore();
+      return;
+    }
+
+    // 1. 3D Extruded Side Faces for Walls & Center Pillar
+    const sideGrad = ctx.createLinearGradient(fTL.x, fTL.y, fTL.x, fBL.y);
+    sideGrad.addColorStop(0, '#9e2412');
+    sideGrad.addColorStop(1, '#4f1008');
+
     if (fTR.x < cam.vpX && obs.wx2 < 0.99) {
-      ctx.fillStyle = sideFill;
+      ctx.fillStyle = sideGrad;
       ctx.beginPath();
       ctx.moveTo(fTR.x, fTR.y);
       ctx.lineTo(bTR.x, bTR.y);
@@ -1608,14 +2044,13 @@ class SwerveGame {
       ctx.lineTo(fBR.x, fBR.y);
       ctx.closePath();
       ctx.fill();
-      ctx.strokeStyle = isBeamCleared ? 'rgba(200, 245, 59, 0.55)' : 'rgba(255, 165, 145, 0.35)';
-      ctx.lineWidth = 1.2;
+      ctx.strokeStyle = 'rgba(255, 155, 130, 0.45)';
+      ctx.lineWidth = 1.3;
       ctx.stroke();
     }
 
-    // Left inner face (visible when obstacle's left edge is right of vanishing point)
     if (fTL.x > cam.vpX && obs.wx1 > -0.99) {
-      ctx.fillStyle = sideFill;
+      ctx.fillStyle = sideGrad;
       ctx.beginPath();
       ctx.moveTo(fTL.x, fTL.y);
       ctx.lineTo(bTL.x, bTL.y);
@@ -1623,112 +2058,64 @@ class SwerveGame {
       ctx.lineTo(fBL.x, fBL.y);
       ctx.closePath();
       ctx.fill();
-      ctx.strokeStyle = isBeamCleared ? 'rgba(200, 245, 59, 0.55)' : 'rgba(255, 165, 145, 0.35)';
-      ctx.lineWidth = 1.2;
+      ctx.strokeStyle = 'rgba(255, 155, 130, 0.45)';
+      ctx.lineWidth = 1.3;
       ctx.stroke();
     }
 
-    // Top 3D bevel face for overhead Low Beam crossbar (visible when crossbar top is below horizon vpY)
-    if (isBeam && fTL.y > cam.vpY) {
-      ctx.fillStyle = topFill;
+    // 2. Sculpted Energy-Core Barrier Front Face
+    const frontGrad = ctx.createLinearGradient(fTL.x, fTL.y, fTR.x, fBL.y);
+    frontGrad.addColorStop(0, '#ff6442');
+    frontGrad.addColorStop(0.5, '#e83417');
+    frontGrad.addColorStop(1, '#9c1c0b');
+    ctx.fillStyle = frontGrad;
+    ctx.fillRect(fTL.x, fTL.y, fw, fh);
+
+    // Animated diagonal hazard stripes + luminous vertical energy scanline clipped inside face
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(fTL.x, fTL.y, fw, fh);
+    ctx.clip();
+
+    ctx.fillStyle = 'rgba(8, 10, 14, 0.22)';
+    const stripeW = Math.max(9, 24 * fTL.s);
+    for (let sx = fTL.x - fh; sx < fTR.x + fh; sx += stripeW * 2.2) {
       ctx.beginPath();
-      ctx.moveTo(fTL.x, fTL.y);
-      ctx.lineTo(fTR.x, fTR.y);
-      ctx.lineTo(bTR.x, bTR.y);
-      ctx.lineTo(bTL.x, bTL.y);
+      ctx.moveTo(sx, fBL.y);
+      ctx.lineTo(sx + stripeW, fBL.y);
+      ctx.lineTo(sx + stripeW + fh * 0.42, fTL.y);
+      ctx.lineTo(sx + fh * 0.42, fTL.y);
       ctx.closePath();
       ctx.fill();
-      ctx.strokeStyle = isBeamCleared ? 'rgba(200, 245, 59, 0.65)' : 'rgba(255, 185, 168, 0.45)';
-      ctx.lineWidth = 1.2;
-      ctx.stroke();
     }
 
-    // Underside face for overhead Low Beam (visible if beam bottom rises above vpY)
-    if (isBeam && fBL.y < cam.vpY) {
-      ctx.fillStyle = underFill;
-      ctx.beginPath();
-      ctx.moveTo(fBL.x, fBL.y);
-      ctx.lineTo(fBR.x, fBR.y);
-      ctx.lineTo(bBR.x, bBR.y);
-      ctx.lineTo(bBL.x, bBL.y);
-      ctx.closePath();
-      ctx.fill();
-      ctx.strokeStyle = isBeamCleared ? COLORS.volt : 'rgba(255, 165, 145, 0.45)';
-      ctx.lineWidth = 1.4;
-      ctx.stroke();
-    }
+    // Subtle animated energy sheen sweeping vertically across the barrier
+    const scanFrac = ((nowMs * 0.0014 + zFront * 2) % 1);
+    const scanY = fTL.y + scanFrac * fh;
+    const scanGrad = ctx.createLinearGradient(0, scanY - 18, 0, scanY + 18);
+    scanGrad.addColorStop(0, 'rgba(255, 220, 200, 0)');
+    scanGrad.addColorStop(0.5, 'rgba(255, 220, 200, 0.28)');
+    scanGrad.addColorStop(1, 'rgba(255, 220, 200, 0)');
+    ctx.fillStyle = scanGrad;
+    ctx.fillRect(fTL.x, scanY - 18, fw, 36);
+    ctx.restore();
 
-    // 2. Draw Front Face
-    const fw = fTR.x - fTL.x;
-    const fh = fBL.y - fTL.y;
+    // Crisp luminous inner tech border & corner brackets
+    ctx.strokeStyle = 'rgba(255, 205, 188, 0.85)';
+    ctx.lineWidth = Math.max(1.2, 2.4 * fTL.s);
+    ctx.strokeRect(fTL.x, fTL.y, fw, fh);
 
-    if (isBeamCleared) {
-      // Safe ducked clearance look: crisp translucent volt frame
-      ctx.fillStyle = 'rgba(200, 245, 59, 0.2)';
-      ctx.fillRect(fTL.x, fTL.y, fw, fh);
-      ctx.strokeStyle = COLORS.volt;
-      ctx.lineWidth = Math.max(1.5, 2.8 * fTL.s);
-      ctx.strokeRect(fTL.x, fTL.y, fw, fh);
-    } else {
-      // High-contrast studio vermilion barrier with subtle gradient depth & hazard chevrons
-      const grad = ctx.createLinearGradient(fTL.x, fTL.y, fTL.x, fBL.y);
-      grad.addColorStop(0, '#ff5c3d');
-      grad.addColorStop(1, '#db3218');
-      ctx.fillStyle = grad;
-      ctx.fillRect(fTL.x, fTL.y, fw, fh);
-
-      // Diagonal hazard stripes clipped to front face
-      ctx.save();
-      ctx.beginPath();
-      ctx.rect(fTL.x, fTL.y, fw, fh);
-      ctx.clip();
-      ctx.fillStyle = 'rgba(12, 14, 16, 0.18)';
-      const stripeW = Math.max(8, 22 * fTL.s);
-      for (let sx = fTL.x - fh; sx < fTR.x + fh; sx += stripeW * 2.2) {
-        ctx.beginPath();
-        ctx.moveTo(sx, fBL.y);
-        ctx.lineTo(sx + stripeW, fBL.y);
-        ctx.lineTo(sx + stripeW + fh * 0.45, fTL.y);
-        ctx.lineTo(sx + fh * 0.45, fTL.y);
-        ctx.closePath();
-        ctx.fill();
-      }
-      ctx.restore();
-
-      // Bright edge bevel for razor-sharp 3D read
-      ctx.strokeStyle = 'rgba(255, 200, 185, 0.72)';
-      ctx.lineWidth = Math.max(1, 2.2 * fTL.s);
-      ctx.strokeRect(fTL.x, fTL.y, fw, fh);
-    }
-
-    // 3. Low Beam bottom clearance lip & badge
-    if (isBeam && fw > 90) {
-      ctx.fillStyle = isBeamCleared ? COLORS.volt : '#fff1ec';
-      const lipH = Math.max(2, 4 * fTL.s);
-      ctx.fillRect(fBL.x, fBL.y - lipH, fw, lipH);
-
-      const fontSize = clamp(Math.round(13 * fTL.s), 9, 15);
-      const badgeText = isBeamCleared ? 'CLEAR ✓' : 'DUCK UNDER';
-      ctx.font = `700 ${fontSize}px "JetBrains Mono", monospace`;
-      const tw = ctx.measureText(badgeText).width;
-      const bw = tw + 16;
-      const bh = fontSize + 10;
-      const bx = fBL.x + (fw - bw) * 0.5;
-      const by = fBL.y - bh - Math.max(8, 12 * fTL.s);
-
-      ctx.fillStyle = isBeamCleared ? COLORS.volt : 'rgba(12, 14, 16, 0.88)';
-      this._roundRect(ctx, bx, by, bw, bh, 5);
-      ctx.fill();
-      ctx.fillStyle = isBeamCleared ? '#0b0e05' : '#ffffff';
-      ctx.textAlign = 'center';
-      ctx.fillText(badgeText, fBL.x + fw * 0.5, by + bh - 6);
-      ctx.textAlign = 'left';
+    const inset = Math.max(4, 10 * fTL.s);
+    if (fw > inset * 3 && fh > inset * 3) {
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.24)';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(fTL.x + inset, fTL.y + inset, fw - inset * 2, fh - inset * 2);
     }
 
     ctx.restore();
   }
 
-  _draw3DRing(ctx, ring, cam) {
+  _draw3DRing(ctx, ring, cam, nowMs) {
     const pt = this._project(ring.wx, ring.wy, ring.z, cam);
     const floorPt = this._project(ring.wx, 1.0, ring.z, cam);
 
@@ -1737,38 +2124,65 @@ class SwerveGame {
     const alpha = farFade * nearFade;
     if (alpha <= 0.01) return;
 
-    const r = clamp(this.playW * 0.048, 16, 22) * pt.s;
-    const spinScaleX = 0.48 + Math.abs(Math.cos(ring.spin)) * 0.52;
+    const r = clamp(this.playW * 0.05, 16, 23) * pt.s;
+    const spinScaleX = 0.45 + Math.abs(Math.cos(ring.spin)) * 0.55;
 
     ctx.save();
     ctx.globalAlpha = alpha;
 
-    // Subtle amber floor reflection shadow for instant 3D depth grounding
-    ctx.fillStyle = 'rgba(255, 184, 46, 0.24)';
+    // Glowing amber floor reflection
+    ctx.fillStyle = 'rgba(255, 184, 46, 0.34)';
     ctx.beginPath();
-    ctx.ellipse(floorPt.x, floorPt.y - 2, r * 0.85, Math.max(2, r * 0.22), 0, 0, Math.PI * 2);
+    ctx.ellipse(floorPt.x, floorPt.y - 2, r * 1.15, Math.max(2.5, r * 0.26), 0, 0, Math.PI * 2);
     ctx.fill();
 
-    // Soft halo
+    // Additive radiant golden bloom
     ctx.translate(pt.x, pt.y);
-    ctx.fillStyle = 'rgba(255, 184, 46, 0.18)';
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    const glow = ctx.createRadialGradient(0, 0, r * 0.2, 0, 0, r * 1.9);
+    glow.addColorStop(0, 'rgba(255, 214, 102, 0.46)');
+    glow.addColorStop(0.55, 'rgba(255, 164, 34, 0.18)');
+    glow.addColorStop(1, 'rgba(255, 164, 34, 0)');
+    ctx.fillStyle = glow;
     ctx.beginPath();
-    ctx.arc(0, 0, r * 1.35, 0, Math.PI * 2);
+    ctx.arc(0, 0, r * 1.9, 0, Math.PI * 2);
     ctx.fill();
+    ctx.restore();
 
-    // Spinning 3D gold ring
+    // Spinning 3D dual gold ring
+    ctx.save();
     ctx.scale(spinScaleX, 1);
     ctx.strokeStyle = COLORS.amber;
-    ctx.lineWidth = Math.max(2, 4.4 * pt.s);
+    ctx.lineWidth = Math.max(2.2, 4.8 * pt.s);
     ctx.beginPath();
     ctx.arc(0, 0, r, 0, Math.PI * 2);
     ctx.stroke();
 
-    ctx.strokeStyle = '#fff2cc';
-    ctx.lineWidth = Math.max(1, 1.6 * pt.s);
+    ctx.strokeStyle = '#fff6d6';
+    ctx.lineWidth = Math.max(1.1, 1.9 * pt.s);
     ctx.beginPath();
-    ctx.arc(0, 0, Math.max(1, r - 3.5 * pt.s), -Math.PI * 0.65, Math.PI * 0.15);
+    ctx.arc(0, 0, Math.max(1, r - 3.6 * pt.s), -Math.PI * 0.7, Math.PI * 0.2);
     ctx.stroke();
+    ctx.restore();
+
+    // Orbiting sparkle star glint
+    const glintAng = nowMs * 0.005 + ring.spin;
+    const gx = Math.cos(glintAng) * r * 1.15;
+    const gy = Math.sin(glintAng) * r * 0.7;
+    const gs = Math.max(2, 4.2 * pt.s);
+    ctx.fillStyle = '#fff9e0';
+    ctx.beginPath();
+    ctx.moveTo(gx, gy - gs);
+    ctx.lineTo(gx + gs * 0.35, gy - gs * 0.35);
+    ctx.lineTo(gx + gs, gy);
+    ctx.lineTo(gx + gs * 0.35, gy + gs * 0.35);
+    ctx.lineTo(gx, gy + gs);
+    ctx.lineTo(gx - gs * 0.35, gy + gs * 0.35);
+    ctx.lineTo(gx - gs, gy);
+    ctx.lineTo(gx - gs * 0.35, gy - gs * 0.35);
+    ctx.closePath();
+    ctx.fill();
 
     ctx.restore();
   }
@@ -1995,16 +2409,20 @@ class SwerveGame {
       this.controlMode === 'camera' && this.poseState.hasPose ? (this.poseState.shoulderTilt || 0) * 0.72 : 0;
     const torsoLean = clamp(this.player.vx * 0.16 + liveTilt, -0.44, 0.44);
 
-    // 1. Subtle ghosted motion echoes during fast leans
-    if (Math.abs(this.player.vx) > 0.25 && this.player.trail.length > 2) {
+    const isFever = this.combo >= 4 && this.state === 'playing';
+    const auraRgb = isFever ? '50, 230, 255' : '200, 245, 59';
+
+    // 1. Kinetic ghosted motion echoes during fast leans or Fever streak
+    if ((Math.abs(this.player.vx) > 0.22 || isFever) && this.player.trail.length > 2) {
       ctx.save();
+      ctx.globalCompositeOperation = 'lighter';
       for (let i = 1; i < this.player.trail.length; i += 2) {
         const tp = this.player.trail[i];
         const frac = 1 - i / this.player.trail.length;
         const ghostH = lerp(H * 0.88, H * 0.54, tp.duck);
-        ctx.fillStyle = `rgba(200, 245, 59, ${(frac * 0.14).toFixed(3)})`;
+        ctx.fillStyle = `rgba(${auraRgb}, ${(frac * (isFever ? 0.24 : 0.14)).toFixed(3)})`;
         ctx.beginPath();
-        ctx.ellipse(tp.floorX, tp.floorY - ghostH * 0.54, H * 0.15, ghostH * 0.44, torsoLean * 0.5, 0, Math.PI * 2);
+        ctx.ellipse(tp.floorX, tp.floorY - ghostH * 0.54, H * 0.16, ghostH * 0.44, torsoLean * 0.5, 0, Math.PI * 2);
         ctx.fill();
       }
       ctx.restore();
@@ -2013,17 +2431,31 @@ class SwerveGame {
     ctx.save();
     ctx.translate(pm.floorX, pm.floorY);
 
-    // 2. Grounded 3D elliptical floor shadow + active duck clearance ring
+    // 1b. Soft energy aura behind runner (pulses stronger in Fever mode)
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    const auraCy = -lerp(H * 0.52, H * 0.32, duck);
+    const auraR = H * (isFever ? 0.62 + Math.sin(nowMs * 0.014) * 0.06 : 0.44);
+    const auraGrad = ctx.createRadialGradient(0, auraCy, 6, 0, auraCy, auraR);
+    auraGrad.addColorStop(0, `rgba(${auraRgb}, ${isFever ? 0.34 : 0.16})`);
+    auraGrad.addColorStop(1, `rgba(${auraRgb}, 0)`);
+    ctx.fillStyle = auraGrad;
+    ctx.beginPath();
+    ctx.arc(0, auraCy, auraR, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+
+    // 2. Grounded 3D elliptical floor shadow + glowing clearance ring
     const shadowRx = H * (0.22 + duck * 0.12);
-    ctx.fillStyle = 'rgba(0, 0, 0, 0.48)';
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.54)';
     ctx.beginPath();
     ctx.ellipse(0, -1, shadowRx, Math.max(4, H * 0.045), 0, 0, Math.PI * 2);
     ctx.fill();
 
-    ctx.strokeStyle = this.player.isDucked ? COLORS.volt : 'rgba(200, 245, 59, 0.34)';
-    ctx.lineWidth = this.player.isDucked ? 2 : 1.25;
+    ctx.strokeStyle = this.player.isDucked ? COLORS.volt : isFever ? COLORS.cyan : 'rgba(200, 245, 59, 0.42)';
+    ctx.lineWidth = this.player.isDucked || isFever ? 2.2 : 1.3;
     ctx.beginPath();
-    ctx.ellipse(0, -1, shadowRx * 1.18, Math.max(5, H * 0.055), 0, 0, Math.PI * 2);
+    ctx.ellipse(0, -1, shadowRx * 1.2, Math.max(5, H * 0.055), 0, 0, Math.PI * 2);
     ctx.stroke();
 
     // 3. Skeleton joint coordinates in runner-local space (y=0 is floor, negative y is UP)
@@ -2228,44 +2660,143 @@ class SwerveGame {
     ctx.restore();
   }
 
-  _drawParticles(ctx) {
+  _drawShockwaves(ctx) {
+    if (this.shockwaves.length === 0) return;
     ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    for (const sw of this.shockwaves) {
+      const alpha = clamp(sw.life / sw.maxLife, 0, 1);
+      ctx.globalAlpha = alpha * 0.85;
+      ctx.strokeStyle = sw.color;
+      ctx.lineWidth = Math.max(1, sw.lineWidth * alpha);
+      ctx.beginPath();
+      ctx.arc(sw.x, sw.y, sw.radius, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  _drawParticles(ctx) {
+    if (this.particles.length === 0) return;
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.lineCap = 'round';
     for (const pt of this.particles) {
       const alpha = clamp(pt.life / pt.maxLife, 0, 1);
       ctx.globalAlpha = alpha;
-      ctx.fillStyle = pt.color;
-      ctx.fillRect(pt.x - pt.size * 0.5, pt.y - pt.size * 0.5, pt.size, pt.size);
+      // Draw elongated velocity spark streak
+      const tailX = pt.x - pt.vx * 0.032;
+      const tailY = pt.y - pt.vy * 0.032;
+      ctx.strokeStyle = pt.color;
+      ctx.lineWidth = pt.size * (0.65 + alpha * 0.5);
+      ctx.beginPath();
+      ctx.moveTo(tailX, tailY);
+      ctx.lineTo(pt.x, pt.y);
+      ctx.stroke();
+
+      // Bright hot center spark dot
+      ctx.fillStyle = '#ffffff';
+      ctx.beginPath();
+      ctx.arc(pt.x, pt.y, pt.size * 0.38, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  _drawSpeedLines(ctx, nowMs) {
+    const intensity = clamp((this.combo - 2) * 0.14 + (this.elapsedRunSec / 120) * 0.35, 0, 0.85);
+    if (intensity <= 0.05 || this.state !== 'playing') return;
+
+    const zone = this._getCurrentZone();
+    const rgb = this.combo >= 4 ? '50, 230, 255' : zone.rgb;
+    const cx = this.viewW * 0.5;
+    const cy = this.viewH * 0.44;
+    const maxR = Math.hypot(this.viewW, this.viewH) * 0.62;
+    const count = 14;
+
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.lineCap = 'round';
+    for (let i = 0; i < count; i++) {
+      const baseAngle = (Math.PI * 2 * i) / count + Math.sin(i * 7.3) * 0.14;
+      const pulse = ((nowMs * 0.0024 + i * 0.37) % 1);
+      const rInner = maxR * (0.58 + pulse * 0.22);
+      const rOuter = maxR * (0.86 + pulse * 0.28);
+      const alpha = intensity * (1 - pulse) * 0.42;
+
+      ctx.strokeStyle = `rgba(${rgb}, ${alpha.toFixed(3)})`;
+      ctx.lineWidth = 1.4 + (1 - pulse) * 1.4;
+      ctx.beginPath();
+      ctx.moveTo(cx + Math.cos(baseAngle) * rInner, cy + Math.sin(baseAngle) * rInner);
+      ctx.lineTo(cx + Math.cos(baseAngle) * rOuter, cy + Math.sin(baseAngle) * rOuter);
+      ctx.stroke();
     }
     ctx.restore();
   }
 
   _drawCallouts(ctx) {
+    if (this.callouts.length === 0) return;
     ctx.save();
     ctx.textAlign = 'center';
     for (const c of this.callouts) {
-      const alpha = clamp(c.life / (c.maxLife * 0.65), 0, 1);
+      const progress = 1 - clamp(c.life / c.maxLife, 0, 1);
+      const scale = progress < 0.15 ? 0.72 + (progress / 0.15) * 0.38 : 1.0 + Math.max(0, 0.1 - (progress - 0.15) * 0.4);
+      const alpha = clamp(c.life / (c.maxLife * 0.55), 0, 1);
+
+      ctx.save();
+      ctx.translate(c.x, c.y);
+      ctx.scale(scale, scale);
       ctx.globalAlpha = alpha;
-      ctx.font = `700 ${c.size}px "JetBrains Mono", monospace`;
-      ctx.lineWidth = 3.5;
-      ctx.strokeStyle = 'rgba(12, 14, 16, 0.85)';
-      ctx.strokeText(c.text, c.x, c.y);
+      ctx.font = `italic 700 ${c.size}px "Chakra Petch", sans-serif`;
+      ctx.lineWidth = 4;
+      ctx.strokeStyle = 'rgba(7, 9, 12, 0.92)';
+      ctx.strokeText(c.text, 0, 0);
       ctx.fillStyle = c.color;
-      ctx.fillText(c.text, c.x, c.y);
+      ctx.fillText(c.text, 0, 0);
+      ctx.restore();
     }
     ctx.textAlign = 'left';
+    ctx.restore();
+  }
+
+  _drawZoneBanner(ctx) {
+    if (!this.zoneBanner) return;
+    const b = this.zoneBanner;
+    const alpha = clamp(Math.min(b.life * 2.2, (b.maxLife - b.life) * 4), 0, 1);
+
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.textAlign = 'center';
+    const cx = this.viewW * 0.5;
+    const cy = this.viewH * 0.34;
+
+    ctx.font = '700 13px "JetBrains Mono", monospace';
+    ctx.fillStyle = b.color;
+    ctx.fillText(b.tag, cx, cy - 26);
+
+    ctx.font = 'italic 700 34px "Chakra Petch", sans-serif';
+    ctx.lineWidth = 5;
+    ctx.strokeStyle = 'rgba(7, 9, 12, 0.9)';
+    ctx.strokeText(b.name, cx, cy + 4);
+    ctx.fillStyle = '#ffffff';
+    ctx.fillText(b.name, cx, cy + 4);
     ctx.restore();
   }
 
   _drawReadyBanner(ctx) {
     ctx.save();
     const alpha = clamp(this.readyTimer / 0.6, 0, 1);
-    ctx.globalAlpha = Math.min(1, alpha * 1.8);
-    ctx.font = '700 42px "Space Grotesk", sans-serif';
+    const scale = 1.15 - alpha * 0.15;
+    ctx.translate(this.viewW * 0.5, this.viewH * 0.42);
+    ctx.scale(scale, scale);
+    ctx.globalAlpha = Math.min(1, alpha * 1.9);
+    ctx.font = 'italic 700 50px "Chakra Petch", sans-serif';
     ctx.textAlign = 'center';
+    ctx.lineWidth = 6;
+    ctx.strokeStyle = 'rgba(7, 9, 12, 0.88)';
+    ctx.strokeText('SWERVE!', 0, 0);
     ctx.fillStyle = COLORS.volt;
-    ctx.shadowColor = 'rgba(0, 0, 0, 0.65)';
-    ctx.shadowBlur = 16;
-    ctx.fillText('SWERVE!', this.viewW * 0.5, this.viewH * 0.44);
+    ctx.fillText('SWERVE!', 0, 0);
     ctx.restore();
   }
 
