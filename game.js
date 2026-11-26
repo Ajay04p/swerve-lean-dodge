@@ -31,9 +31,10 @@ const COLORS = {
 const FOCAL_LENGTH = 0.29;
 const SPAWN_Z = 1.05;
 const DESPAWN_Z = -0.22;
-const PLAYER_UPRIGHT_WY = -0.14;
-const PLAYER_DUCK_WY = 0.48;
-const LOW_BEAM_BOTTOM_WY = -0.06;
+const PLAYER_UPRIGHT_WY = 0.68;
+const PLAYER_DUCK_WY = 0.85;
+const LOW_BEAM_TOP_WY = 0.16;
+const LOW_BEAM_BOTTOM_WY = 0.6;
 
 function clamp(v, min, max) {
   return Math.max(min, Math.min(max, v));
@@ -160,6 +161,7 @@ class SwerveGame {
     this.peakCombo = 1;
     this.elapsedRunSec = 0;
     this.tunnelScroll = 0;
+    this.runCycle = 0;
     this.readyTimer = 0;
     this.invulnTimer = 0;
     this.shakeTime = 0;
@@ -712,10 +714,10 @@ class SwerveGame {
     const cx = this.viewW * 0.5;
     const cy = this.viewH * 0.54;
 
-    // Head-coupled 3D parallax: leaning shifts horizon X, ducking drops eye line Y
+    // Slight elevated third-person 3D chase-cam with head-coupled lean & duck parallax
     const leanNorm = (this.player.x - 0.5) * 2; // -1..1
     const vpX = cx - leanNorm * (this.playW * 0.085);
-    const vpY = this.viewH * 0.53 + this.player.duckAnim * (this.viewH * 0.11);
+    const vpY = this.viewH * 0.42 + this.player.duckAnim * (this.viewH * 0.055);
 
     return { nearW, nearH, cx, cy, vpX, vpY };
   }
@@ -729,16 +731,17 @@ class SwerveGame {
 
   _getPlayerMetrics() {
     const cam = this._getCorridorCamera();
-    const wx = clamp((this.player.x - 0.5) * 1.72, -0.84, 0.84);
+    const wx = clamp((this.player.x - 0.5) * 1.7, -0.83, 0.83);
     const wy = lerp(PLAYER_UPRIGHT_WY, PLAYER_DUCK_WY, this.player.duckAnim);
     const pt = this._project(wx, wy, 0, cam);
     const floorPt = this._project(wx, 1.0, 0, cam);
 
-    // Compact, nimble studio reticle (~38% smaller than before)
-    const r = clamp(this.playW * 0.032, 11, 15);
-    const hitHalfWx = (r * 0.84) / (cam.nearW * 0.5);
+    // Compact, athletic runner height scaled cleanly to corridor height
+    const bodyH = clamp(cam.nearH * 0.255, 108, 154);
+    const r = clamp(bodyH * 0.115, 12, 17);
+    const hitHalfWx = clamp((bodyH * 0.145) / (cam.nearW * 0.5), 0.068, 0.105);
 
-    return { x: pt.x, y: pt.y, floorX: floorPt.x, floorY: floorPt.y, wx, wy, r, hitHalfWx, cam };
+    return { x: pt.x, y: pt.y, floorX: floorPt.x, floorY: floorPt.y, wx, wy, r, bodyH, hitHalfWx, cam };
   }
 
   _getDifficulty() {
@@ -814,7 +817,7 @@ class SwerveGame {
     } else if (type === 'lowBeam') {
       wx1 = -1.0;
       wx2 = 1.0;
-      wy1 = -1.0;
+      wy1 = LOW_BEAM_TOP_WY;
       wy2 = LOW_BEAM_BOTTOM_WY;
       depth = 0.12;
     }
@@ -917,6 +920,7 @@ class SwerveGame {
     // Gentle tunnel drift on start / ready screens
     if (this.state === 'start' || this.state === 'ready') {
       this.tunnelScroll = (this.tunnelScroll + dtSec * 0.35) % 1;
+      this.runCycle += dtSec * 7.5;
     }
 
     if (this.state === 'calibrating') {
@@ -940,6 +944,7 @@ class SwerveGame {
     this.elapsedRunSec += dtSec;
     const diff = this._getDifficulty();
     this.tunnelScroll = (this.tunnelScroll + dtSec * diff.zSpeed * 0.72) % 1;
+    this.runCycle += dtSec * (9.5 + diff.t * 4.5);
 
     if (this.controlMode === 'practice' && this.elapsedRunSec > 6.5) {
       this.practiceHintEl.style.opacity = '0';
@@ -1014,8 +1019,14 @@ class SwerveGame {
     this.player.duckAnim += (duckTarget - this.player.duckAnim) * (1 - Math.exp(-dtSec / 0.055));
 
     const pm = this._getPlayerMetrics();
-    this.player.trail.unshift({ x: pm.x, y: pm.y, duck: this.player.duckAnim });
-    if (this.player.trail.length > 7) {
+    this.player.trail.unshift({
+      x: pm.x,
+      y: pm.y,
+      floorX: pm.floorX,
+      floorY: pm.floorY,
+      duck: this.player.duckAnim,
+    });
+    if (this.player.trail.length > 5) {
       this.player.trail.pop();
     }
   }
@@ -1237,7 +1248,7 @@ class SwerveGame {
       this._drawPracticeDuckZone(ctx);
     }
 
-    // 4. 3D Telegraphs, Painter-Sorted Obstacles & Gold Rings, and Compact Player Core
+    // 4. 3D Telegraphs & Painter-Sorted Obstacles, Gold Rings, and Runner Body
     if (
       this.state === 'playing' ||
       this.state === 'ready' ||
@@ -1245,8 +1256,7 @@ class SwerveGame {
       this.state === 'gameover'
     ) {
       this._drawTelegraphs(ctx, cam, nowMs);
-      this._draw3DEntitiesSorted(ctx, cam);
-      this._drawPlayerCore(ctx, nowMs);
+      this._draw3DEntitiesSorted(ctx, cam, nowMs);
       this._drawParticles(ctx);
       this._drawCallouts(ctx);
     }
@@ -1395,9 +1405,9 @@ class SwerveGame {
     }
   }
 
-  _draw3DEntitiesSorted(ctx, cam) {
-    // Painter's algorithm: collect active obstacles & rings, sort farthest (largest z) to nearest
-    const items = [];
+  _draw3DEntitiesSorted(ctx, cam, nowMs) {
+    // Painter's algorithm: sort obstacles, gold rings, and the player avatar body (z=0) back-to-front
+    const items = [{ kind: 'player', z: 0.0, ref: null }];
     for (const obs of this.obstacles) {
       if (obs.state === 'active') {
         items.push({ kind: 'obs', z: obs.z, ref: obs });
@@ -1414,8 +1424,10 @@ class SwerveGame {
     for (const item of items) {
       if (item.kind === 'obs') {
         this._draw3DObstacle(ctx, item.ref, cam);
-      } else {
+      } else if (item.kind === 'ring') {
         this._draw3DRing(ctx, item.ref, cam);
+      } else {
+        this._drawPlayerBody(ctx, nowMs);
       }
     }
   }
@@ -1447,8 +1459,9 @@ class SwerveGame {
     ctx.save();
     ctx.globalAlpha = alpha;
 
-    // 1. Draw visible 3D extruded side / underside faces first (receding toward vanishing point)
+    // 1. Draw visible 3D extruded side / top / underside faces first
     const sideFill = isBeamCleared ? 'rgba(130, 180, 32, 0.34)' : COLORS.vermilionSide;
+    const topFill = isBeamCleared ? 'rgba(165, 215, 48, 0.36)' : '#c7311a';
     const underFill = isBeamCleared ? 'rgba(200, 245, 59, 0.26)' : COLORS.vermilionDeep;
 
     // Right inner face (visible when obstacle's right edge is left of vanishing point)
@@ -1481,7 +1494,22 @@ class SwerveGame {
       ctx.stroke();
     }
 
-    // Underside face for overhead Low Beam (visible whenever beam bottom is above eye horizon vpY)
+    // Top 3D bevel face for overhead Low Beam crossbar (visible when crossbar top is below horizon vpY)
+    if (isBeam && fTL.y > cam.vpY) {
+      ctx.fillStyle = topFill;
+      ctx.beginPath();
+      ctx.moveTo(fTL.x, fTL.y);
+      ctx.lineTo(fTR.x, fTR.y);
+      ctx.lineTo(bTR.x, bTR.y);
+      ctx.lineTo(bTL.x, bTL.y);
+      ctx.closePath();
+      ctx.fill();
+      ctx.strokeStyle = isBeamCleared ? 'rgba(200, 245, 59, 0.65)' : 'rgba(255, 185, 168, 0.45)';
+      ctx.lineWidth = 1.2;
+      ctx.stroke();
+    }
+
+    // Underside face for overhead Low Beam (visible if beam bottom rises above vpY)
     if (isBeam && fBL.y < cam.vpY) {
       ctx.fillStyle = underFill;
       ctx.beginPath();
@@ -1797,98 +1825,269 @@ class SwerveGame {
     ctx.restore();
   }
 
-  _drawPlayerCore(ctx, nowMs) {
+  _drawLimb(ctx, x1, y1, x2, y2, width, fillColor, rimColor = null) {
+    ctx.save();
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    if (rimColor) {
+      ctx.strokeStyle = rimColor;
+      ctx.lineWidth = width + 2.2;
+      ctx.beginPath();
+      ctx.moveTo(x1, y1);
+      ctx.lineTo(x2, y2);
+      ctx.stroke();
+    }
+    ctx.strokeStyle = fillColor;
+    ctx.lineWidth = width;
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x2, y2);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  _drawPlayerBody(ctx, nowMs) {
     if (this.invulnTimer > 0 && Math.floor(nowMs / 75) % 2 === 0) {
       return;
     }
 
     const pm = this._getPlayerMetrics();
+    const H = pm.bodyH;
     const duck = this.player.duckAnim;
-    const tilt = clamp(this.player.vx * 0.18, -0.32, 0.32);
+    const phase = this.runCycle;
 
-    // 1. 3D Floor shadow directly beneath player core (spatial depth anchor)
+    // Combine lateral lean velocity with live camera shoulder tilt for tactile torso banking
+    const liveTilt =
+      this.controlMode === 'camera' && this.poseState.hasPose ? (this.poseState.shoulderTilt || 0) * 0.72 : 0;
+    const torsoLean = clamp(this.player.vx * 0.16 + liveTilt, -0.44, 0.44);
+
+    // 1. Subtle ghosted motion echoes during fast leans
+    if (Math.abs(this.player.vx) > 0.25 && this.player.trail.length > 2) {
+      ctx.save();
+      for (let i = 1; i < this.player.trail.length; i += 2) {
+        const tp = this.player.trail[i];
+        const frac = 1 - i / this.player.trail.length;
+        const ghostH = lerp(H * 0.88, H * 0.54, tp.duck);
+        ctx.fillStyle = `rgba(200, 245, 59, ${(frac * 0.14).toFixed(3)})`;
+        ctx.beginPath();
+        ctx.ellipse(tp.floorX, tp.floorY - ghostH * 0.54, H * 0.15, ghostH * 0.44, torsoLean * 0.5, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.restore();
+    }
+
     ctx.save();
-    const shadowAlpha = 0.24 + duck * 0.22;
-    ctx.fillStyle = `rgba(200, 245, 59, ${shadowAlpha.toFixed(2)})`;
+    ctx.translate(pm.floorX, pm.floorY);
+
+    // 2. Grounded 3D elliptical floor shadow + active duck clearance ring
+    const shadowRx = H * (0.22 + duck * 0.12);
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.48)';
     ctx.beginPath();
-    ctx.ellipse(pm.floorX, pm.floorY - 2, pm.r * (1.05 + duck * 0.35), 4, 0, 0, Math.PI * 2);
+    ctx.ellipse(0, -1, shadowRx, Math.max(4, H * 0.045), 0, 0, Math.PI * 2);
     ctx.fill();
 
-    // Subtle vertical laser tether from core down to floor shadow
-    ctx.strokeStyle = 'rgba(200, 245, 59, 0.16)';
-    ctx.lineWidth = 1;
-    ctx.setLineDash([3, 4]);
+    ctx.strokeStyle = this.player.isDucked ? COLORS.volt : 'rgba(200, 245, 59, 0.34)';
+    ctx.lineWidth = this.player.isDucked ? 2 : 1.25;
     ctx.beginPath();
-    ctx.moveTo(pm.x, pm.y + pm.r);
-    ctx.lineTo(pm.floorX, pm.floorY - 4);
+    ctx.ellipse(0, -1, shadowRx * 1.18, Math.max(5, H * 0.055), 0, 0, Math.PI * 2);
     ctx.stroke();
-    ctx.setLineDash([]);
-    ctx.restore();
 
-    // 2. Sleek compact motion trail
-    ctx.save();
-    for (let i = 1; i < this.player.trail.length; i++) {
-      const tPt = this.player.trail[i];
-      const frac = 1 - i / this.player.trail.length;
-      ctx.fillStyle = `rgba(200, 245, 59, ${(frac * 0.16).toFixed(3)})`;
+    // 3. Skeleton joint coordinates in runner-local space (y=0 is floor, negative y is UP)
+    const bounce = Math.abs(Math.sin(phase)) * H * 0.028 * (1 - duck);
+    const hipX = torsoLean * H * 0.07;
+    const hipY = -lerp(H * 0.45, H * 0.25, duck) - bounce;
+    const hipHalfW = H * 0.088;
+
+    const torsoH = lerp(H * 0.34, H * 0.23, duck);
+    const shCenterX = hipX + Math.sin(torsoLean) * torsoH;
+    const shCenterY = hipY - Math.cos(torsoLean) * torsoH;
+    const shHalfW = H * 0.165;
+
+    const cosT = Math.cos(torsoLean);
+    const sinT = Math.sin(torsoLean);
+
+    const shL = { x: shCenterX - cosT * shHalfW, y: shCenterY - sinT * shHalfW };
+    const shR = { x: shCenterX + cosT * shHalfW, y: shCenterY + sinT * shHalfW };
+    const hipL = { x: hipX - hipHalfW, y: hipY };
+    const hipR = { x: hipX + hipHalfW, y: hipY };
+
+    // Compute animated sprint legs -> blending smoothly into wide planted athletic crouch when ducking
+    const buildLeg = (side, stridePhase) => {
+      const s = Math.sin(stridePhase); // +1 = foot lifted back, -1 = planted forward
+      const c = Math.cos(stridePhase);
+      const hip = side < 0 ? hipL : hipR;
+
+      // Running stride foot & knee
+      const runFootX = side * H * 0.105 + c * H * 0.02;
+      const runFootY = -Math.max(0, s) * H * 0.135;
+      const runKneeX = side * H * 0.115 + side * Math.max(0, s) * H * 0.02;
+      const runKneeY = hip.y * 0.52 - Math.max(0, s) * H * 0.065;
+
+      // Athletic low crouch stance
+      const duckFootX = side * H * 0.2;
+      const duckFootY = 0;
+      const duckKneeX = side * H * 0.235;
+      const duckKneeY = -H * 0.185;
+
+      return {
+        side,
+        depth: s,
+        hip,
+        knee: { x: lerp(runKneeX, duckKneeX, duck), y: lerp(runKneeY, duckKneeY, duck) },
+        foot: { x: lerp(runFootX, duckFootX, duck), y: lerp(runFootY, duckFootY, duck) },
+      };
+    };
+
+    const legL = buildLeg(-1, phase);
+    const legR = buildLeg(1, phase + Math.PI);
+
+    // Draw farther back-swinging leg first for 3D depth
+    const orderedLegs = legL.depth > legR.depth ? [legL, legR] : [legR, legL];
+    const thighW = Math.max(5.5, H * 0.078);
+    const shinW = Math.max(4.5, H * 0.064);
+
+    for (const leg of orderedLegs) {
+      const isBack = leg.depth > 0.15 && duck < 0.5;
+      const fill = isBack ? '#101419' : '#1b222a';
+      const rim = isBack ? 'rgba(200, 245, 59, 0.28)' : 'rgba(200, 245, 59, 0.72)';
+
+      this._drawLimb(ctx, leg.hip.x, leg.hip.y, leg.knee.x, leg.knee.y, thighW, fill, rim);
+      this._drawLimb(ctx, leg.knee.x, leg.knee.y, leg.foot.x, leg.foot.y, shinW, fill, rim);
+
+      // Crisp sneaker accent
+      ctx.fillStyle = isBack ? '#89aa27' : COLORS.volt;
       ctx.beginPath();
-      ctx.ellipse(
-        tPt.x,
-        tPt.y,
-        pm.r * (0.65 + frac * 0.28) * (1 + tPt.duck * 0.18),
-        pm.r * (0.65 + frac * 0.28) * (1 - tPt.duck * 0.38),
-        0,
-        0,
-        Math.PI * 2
-      );
+      ctx.ellipse(leg.foot.x + leg.side * 2, leg.foot.y - 2, H * 0.055, H * 0.028, 0, 0, Math.PI * 2);
       ctx.fill();
     }
-    ctx.restore();
 
-    // 3. Smaller, crisp tennis-volt studio reticle core
+    // 4. Sculpted Athletic V-Tapered Torso
     ctx.save();
-    ctx.translate(pm.x, pm.y);
-    ctx.rotate(tilt);
-
-    const sx = 1 + duck * 0.22;
-    const sy = 1 - duck * 0.38;
-    ctx.scale(sx, sy);
-
-    // Tight clearance ring
-    ctx.strokeStyle = this.player.isDucked ? 'rgba(200, 245, 59, 0.7)' : 'rgba(200, 245, 59, 0.3)';
-    ctx.lineWidth = 1.5;
+    ctx.fillStyle = '#141920';
+    ctx.strokeStyle = COLORS.volt;
+    ctx.lineWidth = 1.8;
+    ctx.lineJoin = 'round';
     ctx.beginPath();
-    ctx.arc(0, 0, pm.r * 1.32, 0, Math.PI * 2);
-    ctx.stroke();
-
-    // Core puck
-    ctx.fillStyle = COLORS.volt;
-    ctx.beginPath();
-    ctx.arc(0, 0, pm.r, 0, Math.PI * 2);
-    ctx.fill();
-
-    // Crisp charcoal precision center diamond
-    ctx.fillStyle = '#0c0e10';
-    const d = pm.r * 0.44;
-    ctx.beginPath();
-    ctx.moveTo(0, -d);
-    ctx.lineTo(d, 0);
-    ctx.lineTo(0, d);
-    ctx.lineTo(-d, 0);
+    ctx.moveTo(shL.x, shL.y);
+    ctx.lineTo(shR.x, shR.y);
+    ctx.lineTo(hipR.x + 1, hipR.y + 2);
+    ctx.lineTo(hipL.x - 1, hipL.y + 2);
     ctx.closePath();
     ctx.fill();
+    ctx.stroke();
 
+    // High-contrast tennis-volt athletic spine chevron on back of jersey
+    const midChestX = lerp(shCenterX, hipX, 0.44);
+    const midChestY = lerp(shCenterY, hipY, 0.44);
+    ctx.strokeStyle = COLORS.volt;
+    ctx.lineWidth = 2.4;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(lerp(shL.x, shCenterX, 0.35), lerp(shL.y, shCenterY, 0.35) + H * 0.06);
+    ctx.lineTo(midChestX, midChestY + H * 0.05);
+    ctx.lineTo(lerp(shR.x, shCenterX, 0.35), lerp(shR.y, shCenterY, 0.35) + H * 0.06);
+    ctx.stroke();
     ctx.restore();
 
+    // 5. Articulated Arms (mirrored live from camera pose when visible, else dynamic sprint pump)
+    const armW = Math.max(4.5, H * 0.06);
+    const foreW = Math.max(3.8, H * 0.05);
+    const liveArms = this.controlMode === 'camera' && this.poseState.hasPose ? this.poseState.avatarArms : null;
+    const armScale = shHalfW * 1.85;
+
+    const drawArm = (side, shoulder, stridePhase, liveVec) => {
+      let elbow;
+      let hand;
+
+      if (liveVec) {
+        // Live camera pose mirrors your real arms with athletic proportion scaling
+        elbow = {
+          x: shoulder.x + liveVec.ex * armScale,
+          y: shoulder.y + liveVec.ey * armScale,
+        };
+        hand = {
+          x: shoulder.x + liveVec.wx * armScale,
+          y: shoulder.y + liveVec.wy * armScale,
+        };
+      } else {
+        // Kinetic running arm swing counter-phased with legs, sweeping outward when ducking
+        const swing = Math.sin(stridePhase);
+        const runEx = shoulder.x + side * H * 0.085;
+        const runEy = shoulder.y + H * (0.14 + swing * 0.035);
+        const runHx = runEx + side * H * 0.03;
+        const runHy = runEy + H * (0.12 - swing * 0.05);
+
+        const duckEx = shoulder.x + side * H * 0.145;
+        const duckEy = shoulder.y + H * 0.085;
+        const duckHx = duckEx + side * H * 0.085;
+        const duckHy = duckEy + H * 0.065;
+
+        elbow = { x: lerp(runEx, duckEx, duck), y: lerp(runEy, duckEy, duck) };
+        hand = { x: lerp(runHx, duckHx, duck), y: lerp(runHy, duckHy, duck) };
+      }
+
+      this._drawLimb(ctx, shoulder.x, shoulder.y, elbow.x, elbow.y, armW, '#1b222a', 'rgba(200, 245, 59, 0.72)');
+      this._drawLimb(ctx, elbow.x, elbow.y, hand.x, hand.y, foreW, '#1b222a', 'rgba(200, 245, 59, 0.65)');
+
+      // Crisp volt wrist/glove accent
+      ctx.fillStyle = COLORS.volt;
+      ctx.beginPath();
+      ctx.arc(hand.x, hand.y, Math.max(2.6, H * 0.028), 0, Math.PI * 2);
+      ctx.fill();
+    };
+
+    drawArm(-1, shL, phase + Math.PI, liveArms?.left || null);
+    drawArm(1, shR, phase, liveArms?.right || null);
+
+    // 6. Sculpted Tennis-Volt Athletic Head / Helmet
+    const neckLen = lerp(H * 0.115, H * 0.09, duck);
+    const headX = shCenterX + sinT * neckLen;
+    const headY = shCenterY - cosT * neckLen;
+    const headR = clamp(H * 0.102, 11, 15.5);
+
+    ctx.save();
+    ctx.translate(headX, headY);
+    ctx.rotate(torsoLean * 0.65);
+
+    // Subtle dark neck collar
+    ctx.fillStyle = '#0c0e10';
+    ctx.fillRect(-headR * 0.35, headR * 0.65, headR * 0.7, headR * 0.45);
+
+    // Main volt athletic helmet dome
+    ctx.fillStyle = COLORS.volt;
+    ctx.strokeStyle = '#0c0e10';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(0, 0, headR, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+
+    // Sleek charcoal wraparound helmet band / crown stripe
+    ctx.fillStyle = '#12161b';
+    ctx.beginPath();
+    ctx.roundRect?.(-headR * 0.78, -headR * 0.18, headR * 1.56, headR * 0.38, 3);
+    if (!ctx.roundRect) {
+      ctx.rect(-headR * 0.78, -headR * 0.18, headR * 1.56, headR * 0.38);
+    }
+    ctx.fill();
+
+    // Crisp crown specular dot
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.55)';
+    ctx.beginPath();
+    ctx.arc(-headR * 0.25, -headR * 0.45, headR * 0.18, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+
+    // 7. Compact DUCKED badge beneath floor shadow when ducking
     if (this.player.isDucked) {
-      ctx.save();
       ctx.font = '700 9.5px "JetBrains Mono", monospace';
       ctx.textAlign = 'center';
       ctx.fillStyle = COLORS.volt;
-      ctx.fillText('DUCKED', pm.x, pm.y + pm.r + 14);
+      ctx.fillText('DUCKED', 0, 14);
       ctx.textAlign = 'left';
-      ctx.restore();
     }
+
+    ctx.restore();
   }
 
   _drawParticles(ctx) {

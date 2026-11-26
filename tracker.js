@@ -99,11 +99,13 @@ export class PoseTracker {
     this.isDucked = false;
     this.duckProgress = 0;
 
-    // Latest mapped viewport landmarks for skeleton overlay
+    // Latest mapped viewport landmarks for skeleton overlay & avatar body
     this.mappedLandmarks = null;
     this.trackedPointPx = null;
     this.midShoulderPx = null;
     this.nosePx = null;
+    this.shoulderTilt = 0; // radians, + leans screen-right
+    this.avatarArms = { left: null, right: null }; // normalized shoulder-to-elbow/wrist vectors
   }
 
   setSensitivity(mode) {
@@ -247,6 +249,8 @@ export class PoseTracker {
     this.hasInitialSample = false;
     this.poseLostTimer = 0;
     this.motionSpeed = 0;
+    this.shoulderTilt = 0;
+    this.avatarArms = { left: null, right: null };
     this.mappedLandmarks = null;
   }
 
@@ -596,6 +600,42 @@ export class PoseTracker {
       y: this.smoothY * viewH,
     };
 
+    // Smooth shoulder tilt & normalized arm offsets for articulated avatar body
+    if (hasLS && hasRS && measuredSpanPx && measuredSpanPx > 16) {
+      // Mirrored screen: rs (12) is on screen-left, ls (11) is on screen-right
+      const rawTilt = clamp(Math.atan2(ls.y - rs.y, ls.x - rs.x), -0.45, 0.45);
+      const aTilt = emaAlpha(dtSec, 0.075);
+      this.shoulderTilt += (rawTilt - this.shoulderTilt) * aTilt;
+
+      const buildArm = (shoulder, elbow, wrist, prev) => {
+        const hasE = elbow && elbow.visibility >= 0.45;
+        const hasW = wrist && wrist.visibility >= 0.45;
+        if (!hasE) return null;
+        const ex = clamp((elbow.x - shoulder.x) / measuredSpanPx, -1.2, 1.2);
+        const ey = clamp((elbow.y - shoulder.y) / measuredSpanPx, -1.2, 1.4);
+        const wx = hasW ? clamp((wrist.x - shoulder.x) / measuredSpanPx, -1.8, 1.8) : ex * 1.45;
+        const wy = hasW ? clamp((wrist.y - shoulder.y) / measuredSpanPx, -1.8, 1.8) : ey + 0.55;
+        if (!prev) return { ex, ey, wx, wy };
+        const aArm = emaAlpha(dtSec, 0.065);
+        return {
+          ex: prev.ex + (ex - prev.ex) * aArm,
+          ey: prev.ey + (ey - prev.ey) * aArm,
+          wx: prev.wx + (wx - prev.wx) * aArm,
+          wy: prev.wy + (wy - prev.wy) * aArm,
+        };
+      };
+
+      // Screen-left arm = anatomical right (12, 14, 16); Screen-right arm = anatomical left (11, 13, 15)
+      this.avatarArms = {
+        left: buildArm(rs, mapped[14], mapped[16], this.avatarArms.left),
+        right: buildArm(ls, mapped[13], mapped[15], this.avatarArms.right),
+      };
+    } else {
+      const aDecay = emaAlpha(dtSec, 0.14);
+      this.shoulderTilt *= 1 - aDecay;
+      this.avatarArms = { left: null, right: null };
+    }
+
     // Evaluate duck state with hysteresis once calibrated
     if (this.calibrated) {
       const { enterDrop, exitDrop } = this.getDuckThresholdsNormH();
@@ -663,6 +703,8 @@ export class PoseTracker {
       trackedPointPx: this.trackedPointPx,
       midShoulderPx: this.midShoulderPx,
       nosePx: this.nosePx,
+      shoulderTilt: this.shoulderTilt,
+      avatarArms: this.avatarArms,
     };
   }
 }
