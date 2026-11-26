@@ -60,6 +60,9 @@ export class PoseTracker {
 
     this.ready = false;
     this.cameraActive = false;
+    this.facingMode = 'user'; // 'user' | 'environment'
+    this.deviceId = null;
+    this.mirrored = true;
     this.sensitivity = 'normal';
 
     this.lastVideoTime = -1;
@@ -162,39 +165,97 @@ export class PoseTracker {
     return this.delegate;
   }
 
-  async startCamera(videoEl, onStatus = () => {}) {
+  setMirror(mirrored) {
+    this.mirrored = Boolean(mirrored);
+  }
+
+  async listCameras() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) {
+      return [];
+    }
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      return devices
+        .filter((d) => d.kind === 'videoinput')
+        .map((d, idx) => ({
+          deviceId: d.deviceId,
+          label: d.label || `Camera ${idx + 1}`,
+        }));
+    } catch {
+      return [];
+    }
+  }
+
+  async startCamera(videoEl, onStatus = () => {}, options = {}) {
     this.videoEl = videoEl;
 
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       throw new Error('Camera access requires HTTPS and a browser supporting getUserMedia.');
     }
 
-    onStatus('Requesting front camera…');
+    const facingMode = options.facingMode === 'environment' ? 'environment' : 'user';
+    const deviceId = options.deviceId || null;
+    this.facingMode = facingMode;
+    this.deviceId = deviceId;
+
+    const camName = facingMode === 'environment' ? 'back camera' : 'front camera';
+    onStatus(`Requesting ${camName}…`);
     this.stopCamera();
 
-    const constraints = {
-      audio: false,
-      video: {
-        facingMode: { ideal: 'user' },
-        width: { ideal: 640 },
-        height: { ideal: 480 },
-      },
+    const baseVideo = {
+      width: { ideal: 640 },
+      height: { ideal: 480 },
     };
 
-    let stream;
-    try {
-      stream = await navigator.mediaDevices.getUserMedia(constraints);
-    } catch (err) {
+    const attempts = [];
+    if (deviceId) {
+      attempts.push({ audio: false, video: { ...baseVideo, deviceId: { exact: deviceId } } });
+    }
+    if (facingMode === 'environment') {
+      // Try exact rear camera first on mobile so iOS/Android reliably switches off the selfie lens
+      attempts.push({ audio: false, video: { ...baseVideo, facingMode: { exact: 'environment' } } });
+      attempts.push({ audio: false, video: { ...baseVideo, facingMode: { ideal: 'environment' } } });
+    } else {
+      attempts.push({ audio: false, video: { ...baseVideo, facingMode: { ideal: 'user' } } });
+    }
+
+    let stream = null;
+    let lastErr = null;
+    for (const constraints of attempts) {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia(constraints);
+        break;
+      } catch (err) {
+        lastErr = err;
+        // Don't retry on permission denial or busy camera
+        if (err && (err.name === 'NotAllowedError' || err.name === 'NotReadableError')) {
+          break;
+        }
+      }
+    }
+
+    if (!stream) {
+      const err = lastErr;
       if (err && err.name === 'NotAllowedError') {
         throw new Error('Camera permission was denied. Allow camera access or use Practice Mode.');
       }
       if (err && err.name === 'NotFoundError') {
-        throw new Error('No front camera was detected on this device. Try Practice Mode.');
+        throw new Error(`No ${camName} was detected on this device. Try the other camera or Practice Mode.`);
       }
       if (err && err.name === 'NotReadableError') {
         throw new Error('Camera is currently busy in another app. Close it or use Practice Mode.');
       }
-      throw new Error(err?.message || 'Unable to access front camera.');
+      throw new Error(err?.message || `Unable to access ${camName}.`);
+    }
+
+    // Read back actual track settings (deviceId & facingMode if exposed)
+    const videoTrack = stream.getVideoTracks()[0];
+    const trackSettings = videoTrack?.getSettings?.() || {};
+    if (trackSettings.deviceId) {
+      this.deviceId = trackSettings.deviceId;
+    }
+    if (trackSettings.facingMode === 'environment' || trackSettings.facingMode === 'user') {
+      this.facingMode = trackSettings.facingMode;
     }
 
     this.stream = stream;
@@ -299,13 +360,13 @@ export class PoseTracker {
   }
 
   /**
-   * Maps a raw MediaPipe normalized landmark (0..1 in video space) into mirrored
-   * cover-fit viewport pixel coordinates matching `<video style="object-fit:cover; transform:scaleX(-1)">`.
+   * Maps a raw MediaPipe normalized landmark (0..1 in video space) into cover-fit
+   * viewport pixel coordinates matching `<video>` (mirrored for front, unmirrored for back).
    */
   _mapLandmark(lm, vidW, vidH, viewW, viewH) {
     const vidAspect = vidW / vidH;
     const viewAspect = viewW / viewH;
-    const mirroredX = 1 - lm.x;
+    const projX = this.mirrored ? 1 - lm.x : lm.x;
 
     let x;
     let y;
@@ -313,13 +374,13 @@ export class PoseTracker {
       const scale = viewH / vidH;
       const renderedW = vidW * scale;
       const offsetX = (renderedW - viewW) * 0.5;
-      x = mirroredX * renderedW - offsetX;
+      x = projX * renderedW - offsetX;
       y = lm.y * viewH;
     } else {
       const scale = viewW / vidW;
       const renderedH = vidH * scale;
       const offsetY = (renderedH - viewH) * 0.5;
-      x = mirroredX * viewW;
+      x = projX * viewW;
       y = lm.y * renderedH - offsetY;
     }
 
@@ -600,10 +661,21 @@ export class PoseTracker {
       y: this.smoothY * viewH,
     };
 
-    // Smooth shoulder tilt & normalized arm offsets for articulated avatar body
+    // Smooth shoulder tilt & normalized arm offsets (orientation-proof for front/back & mirror)
     if (hasLS && hasRS && measuredSpanPx && measuredSpanPx > 16) {
-      // Mirrored screen: rs (12) is on screen-left, ls (11) is on screen-right
-      const rawTilt = clamp(Math.atan2(ls.y - rs.y, ls.x - rs.x), -0.45, 0.45);
+      const lsIsLeft = ls.x < rs.x;
+      const screenLeftSh = lsIsLeft ? ls : rs;
+      const screenRightSh = lsIsLeft ? rs : ls;
+      const leftElbow = lsIsLeft ? mapped[13] : mapped[14];
+      const leftWrist = lsIsLeft ? mapped[15] : mapped[16];
+      const rightElbow = lsIsLeft ? mapped[14] : mapped[13];
+      const rightWrist = lsIsLeft ? mapped[16] : mapped[15];
+
+      const rawTilt = clamp(
+        Math.atan2(screenRightSh.y - screenLeftSh.y, screenRightSh.x - screenLeftSh.x),
+        -0.45,
+        0.45
+      );
       const aTilt = emaAlpha(dtSec, 0.075);
       this.shoulderTilt += (rawTilt - this.shoulderTilt) * aTilt;
 
@@ -625,10 +697,9 @@ export class PoseTracker {
         };
       };
 
-      // Screen-left arm = anatomical right (12, 14, 16); Screen-right arm = anatomical left (11, 13, 15)
       this.avatarArms = {
-        left: buildArm(rs, mapped[14], mapped[16], this.avatarArms.left),
-        right: buildArm(ls, mapped[13], mapped[15], this.avatarArms.right),
+        left: buildArm(screenLeftSh, leftElbow, leftWrist, this.avatarArms.left),
+        right: buildArm(screenRightSh, rightElbow, rightWrist, this.avatarArms.right),
       };
     } else {
       const aDecay = emaAlpha(dtSec, 0.14);
@@ -683,6 +754,8 @@ export class PoseTracker {
     return {
       ready: this.ready,
       cameraActive: this.cameraActive,
+      facingMode: this.facingMode,
+      mirrored: this.mirrored,
       delegate: this.delegate,
       hasPose: this.hasPose,
       hasFullUpperBody: this.hasFullUpperBody,

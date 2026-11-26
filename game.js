@@ -1,13 +1,15 @@
 // SWERVE — 3D Perspective Lean & Dodge engine, renderer, controls, and UI
 
-import { SoundEngine } from './audio.js?v=4';
-import { PoseTracker, UPPER_BODY_CONNECTIONS, ALIGN_BOUNDS } from './tracker.js?v=4';
+import { SoundEngine } from './audio.js?v=5';
+import { PoseTracker, UPPER_BODY_CONNECTIONS, ALIGN_BOUNDS } from './tracker.js?v=5';
 
 const STORAGE_KEYS = {
   highScore: 'swerve_high_score',
   sensitivity: 'swerve_sensitivity',
   showOverlay: 'swerve_overlay',
   brightness: 'swerve_brightness',
+  cameraFacing: 'swerve_camera_facing',
+  cameraMirror: 'swerve_camera_mirror',
 };
 
 const SENSITIVITY_HINTS = {
@@ -89,6 +91,7 @@ class SwerveGame {
     // Screens
     this.screenStart = document.getElementById('screen-start');
     this.startBestChip = document.getElementById('start-best-chip');
+    this.startFacingBtns = Array.from(document.querySelectorAll('#start-camera-facing .seg-btn'));
     this.screenLoading = document.getElementById('screen-loading');
     this.loadingSpinner = document.getElementById('loading-spinner');
     this.loadingTitle = document.getElementById('loading-title');
@@ -110,6 +113,12 @@ class SwerveGame {
     this.btnSwitchMode = document.getElementById('btn-switch-mode');
     this.engineStatusEl = document.getElementById('engine-status');
 
+    this.settingsFacingBtns = Array.from(document.querySelectorAll('#settings-camera-facing .seg-btn'));
+    this.cameraFacingHintEl = document.getElementById('camera-facing-hint');
+    this.cameraLensGroup = document.getElementById('camera-lens-group');
+    this.selectCameraLens = document.getElementById('select-camera-lens');
+    this.toggleMirror = document.getElementById('toggle-mirror');
+
     this.sensitivityBtns = Array.from(document.querySelectorAll('#sensitivity-control .seg-btn'));
     this.sensitivityHintEl = document.getElementById('sensitivity-hint');
     this.sliderBrightness = document.getElementById('slider-brightness');
@@ -130,15 +139,22 @@ class SwerveGame {
     // Persisted settings
     this.highScore = Math.max(0, parseInt(readStorage(STORAGE_KEYS.highScore, '0'), 10) || 0);
     const storedBrightness = parseInt(readStorage(STORAGE_KEYS.brightness, '45'), 10);
+    const storedFacing = readStorage(STORAGE_KEYS.cameraFacing, 'user');
+    const facing = storedFacing === 'environment' ? 'environment' : 'user';
+    const storedMirror = readStorage(STORAGE_KEYS.cameraMirror, facing === 'user' ? '1' : '0');
     this.settings = {
       sensitivity: readStorage(STORAGE_KEYS.sensitivity, 'normal'),
       showOverlay: readStorage(STORAGE_KEYS.showOverlay, '1') !== '0',
       brightness: clamp(Number.isNaN(storedBrightness) ? 45 : storedBrightness, 0, 100),
+      cameraFacing: facing,
+      mirrored: storedMirror === '1',
+      deviceId: null,
     };
     if (!SENSITIVITY_HINTS[this.settings.sensitivity]) {
       this.settings.sensitivity = 'normal';
     }
     this.tracker.setSensitivity(this.settings.sensitivity);
+    this.tracker.setMirror(this.settings.mirrored);
 
     // Viewport geometry
     this.viewW = window.innerWidth;
@@ -258,11 +274,52 @@ class SwerveGame {
     });
 
     // Calibration screen buttons
+    document.getElementById('btn-calibrate-flip').addEventListener('click', () => {
+      this.audio.unlock();
+      this.audio.click();
+      const nextFacing = this.settings.cameraFacing === 'user' ? 'environment' : 'user';
+      this._setCameraFacing(nextFacing, true);
+    });
+
     document.getElementById('btn-calibrate-practice').addEventListener('click', () => {
       this.audio.click();
       this.tracker.stopCamera();
       this._setCameraVideoVisible(false);
       this.startPracticeMode();
+    });
+
+    // Camera Front / Back selectors (Start screen + Settings modal)
+    const bindFacingButtons = (btns) => {
+      btns.forEach((btn) => {
+        btn.addEventListener('click', () => {
+          this.audio.unlock();
+          this.audio.click();
+          const facing = btn.dataset.facing === 'environment' ? 'environment' : 'user';
+          const switchLive = this.controlMode === 'camera' && this.tracker.cameraActive;
+          this._setCameraFacing(facing, switchLive);
+        });
+      });
+    };
+    bindFacingButtons(this.startFacingBtns);
+    bindFacingButtons(this.settingsFacingBtns);
+
+    this.selectCameraLens.addEventListener('change', () => {
+      this.audio.unlock();
+      this.audio.click();
+      const chosenId = this.selectCameraLens.value || null;
+      this.settings.deviceId = chosenId;
+      if (this.controlMode === 'camera' && this.tracker.cameraActive) {
+        this.startCameraFlow();
+      }
+    });
+
+    this.toggleMirror.addEventListener('change', (e) => {
+      this.audio.unlock();
+      this.audio.click();
+      this.settings.mirrored = Boolean(e.target.checked);
+      writeStorage(STORAGE_KEYS.cameraMirror, this.settings.mirrored ? '1' : '0');
+      this.tracker.setMirror(this.settings.mirrored);
+      this._applySettingsToUI();
     });
 
     // HUD buttons
@@ -477,7 +534,69 @@ class SwerveGame {
     this.playRight = this.playLeft + this.playW;
   }
 
+  _setCameraFacing(facing, restartCamera = false) {
+    const normalized = facing === 'environment' ? 'environment' : 'user';
+    this.settings.cameraFacing = normalized;
+    this.settings.deviceId = null;
+    // Smart default mirror: ON for front selfie camera, OFF for rear camera
+    this.settings.mirrored = normalized === 'user';
+
+    writeStorage(STORAGE_KEYS.cameraFacing, normalized);
+    writeStorage(STORAGE_KEYS.cameraMirror, this.settings.mirrored ? '1' : '0');
+
+    this.tracker.setMirror(this.settings.mirrored);
+    this._applySettingsToUI();
+
+    if (restartCamera) {
+      this.startCameraFlow();
+    }
+  }
+
+  async _populateCameraLenses() {
+    const cams = await this.tracker.listCameras();
+    // Show multi-lens selector when device exposes multiple cameras/lenses (e.g. Wide + Ultra-Wide)
+    if (cams.length <= 2) {
+      this.cameraLensGroup.classList.add('hidden');
+      return;
+    }
+
+    this.selectCameraLens.innerHTML = '';
+    const autoOpt = document.createElement('option');
+    autoOpt.value = '';
+    autoOpt.textContent = `Auto (${this.settings.cameraFacing === 'environment' ? 'Back' : 'Front'})`;
+    this.selectCameraLens.appendChild(autoOpt);
+
+    for (const cam of cams) {
+      const opt = document.createElement('option');
+      opt.value = cam.deviceId;
+      opt.textContent = cam.label;
+      if (this.tracker.deviceId && cam.deviceId === this.tracker.deviceId) {
+        opt.selected = true;
+      }
+      this.selectCameraLens.appendChild(opt);
+    }
+
+    this.cameraLensGroup.classList.remove('hidden');
+  }
+
   _applySettingsToUI() {
+    const syncFacingBtns = (btns) => {
+      btns.forEach((btn) => {
+        const isActive = btn.dataset.facing === this.settings.cameraFacing;
+        btn.classList.toggle('active', isActive);
+        btn.setAttribute('aria-checked', isActive ? 'true' : 'false');
+      });
+    };
+    syncFacingBtns(this.startFacingBtns);
+    syncFacingBtns(this.settingsFacingBtns);
+
+    const facingLabel = this.settings.cameraFacing === 'environment' ? 'Back' : 'Front';
+    const mirrorLabel = this.settings.mirrored ? 'mirrored' : 'unmirrored';
+    this.cameraFacingHintEl.textContent = `${facingLabel} · ${mirrorLabel}`;
+
+    this.videoEl.classList.toggle('mirrored', this.settings.mirrored);
+    this.toggleMirror.checked = this.settings.mirrored;
+
     this.sensitivityBtns.forEach((btn) => {
       const isActive = btn.dataset.sensitivity === this.settings.sensitivity;
       btn.classList.toggle('active', isActive);
@@ -547,15 +666,28 @@ class SwerveGame {
     this.loadingCancelled = false;
     this._showScreen('loading');
     this.loadingSpinner.classList.remove('hidden');
+    const camName = this.settings.cameraFacing === 'environment' ? 'back camera' : 'front camera';
     this.loadingTitle.textContent = 'STARTING CAMERA';
-    this.loadingStatus.textContent = 'Requesting front camera…';
+    this.loadingStatus.textContent = `Requesting ${camName}…`;
     this.cameraErrorBox.classList.add('hidden');
 
     try {
-      await this.tracker.startCamera(this.videoEl, (msg) => {
-        if (!this.loadingCancelled) this.loadingStatus.textContent = msg;
-      });
+      this.tracker.setMirror(this.settings.mirrored);
+      await this.tracker.startCamera(
+        this.videoEl,
+        (msg) => {
+          if (!this.loadingCancelled) this.loadingStatus.textContent = msg;
+        },
+        {
+          facingMode: this.settings.cameraFacing,
+          deviceId: this.settings.deviceId,
+        }
+      );
       if (this.loadingCancelled) return;
+
+      // Sync UI if browser reported actual facingMode and populate multi-lens picker
+      this._applySettingsToUI();
+      this._populateCameraLenses();
 
       this._setCameraVideoVisible(true);
       this.loadingTitle.textContent = 'LOADING POSE MODEL';
@@ -565,8 +697,9 @@ class SwerveGame {
       });
       if (this.loadingCancelled) return;
 
-      this.calibrateDelegate.textContent = `POSE LITE · ${delegate}`;
-      this.engineStatusEl.textContent = `CAMERA · ${delegate}`;
+      const camTag = this.tracker.facingMode === 'environment' ? 'BACK' : 'FRONT';
+      this.calibrateDelegate.textContent = `${camTag} · ${delegate}`;
+      this.engineStatusEl.textContent = `${camTag} CAM · ${delegate}`;
       this.startCalibrationPhase();
     } catch (err) {
       if (this.loadingCancelled) return;
@@ -603,7 +736,8 @@ class SwerveGame {
       this.controlMode === 'camera' ? 'Switch to Practice Mode' : 'Switch to Camera Mode';
 
     if (this.controlMode === 'camera') {
-      this.engineStatusEl.textContent = `CAMERA · ${this.tracker.delegate || 'LITE'}`;
+      const camTag = this.tracker.facingMode === 'environment' ? 'BACK' : 'FRONT';
+      this.engineStatusEl.textContent = `${camTag} CAM · ${this.tracker.delegate || 'LITE'}`;
     } else {
       this.engineStatusEl.textContent = 'PRACTICE · TOUCH / KEYS';
     }
