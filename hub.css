@@ -73,7 +73,7 @@ body {
 .hub-shell {
   position: relative;
   z-index: 2;
-  max-width: 960px;
+  max-width: 1120px;
   margin: 0 auto;
   padding: calc(var(--safe-top) + 18px) 18px calc(var(--safe-bottom) + 40px);
 }
@@ -247,11 +247,17 @@ body {
 /* Playable Game Cards Grid */
 .games-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 18px;
 }
 
-@media (max-width: 720px) {
+@media (max-width: 960px) {
+  .games-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 680px) {
   .games-grid {
     grid-template-columns: 1fr;
   }
@@ -273,6 +279,15 @@ body {
 .game-card:hover {
   transform: translateY(-3px);
   background: var(--bg-card-hover);
+}
+
+.game-card.card-plasma {
+  border-top: 2px solid rgba(255, 56, 174, 0.78);
+}
+
+.game-card.card-plasma:hover {
+  border-color: rgba(255, 56, 174, 0.92);
+  box-shadow: 0 24px 56px rgba(0, 0, 0, 0.65), 0 0 32px rgba(255, 56, 174, 0.18);
 }
 
 .game-card.card-volt {
@@ -302,6 +317,10 @@ body {
   align-items: center;
   justify-content: center;
   border-bottom: 1px solid var(--border);
+}
+
+.card-art.art-slash {
+  background: radial-gradient(circle at 50% 44%, rgba(255, 56, 174, 0.28) 0%, #101224 54%, #060810 100%);
 }
 
 .card-art.art-swerve {
@@ -379,6 +398,10 @@ body {
   color: var(--volt);
 }
 
+.card-plasma .card-mode {
+  color: #ff58bc;
+}
+
 .card-cyan .card-mode {
   color: var(--cyan);
 }
@@ -447,6 +470,12 @@ body {
   background: linear-gradient(135deg, #6ef0ff 0%, var(--cyan) 58%, #10b8e6 100%);
   color: var(--cyan-ink);
   box-shadow: 0 10px 26px rgba(50, 230, 255, 0.28);
+}
+
+.play-cta.cta-plasma {
+  background: linear-gradient(135deg, #ff70c8 0%, #ff38ae 54%, #b524ff 100%);
+  color: #160410;
+  box-shadow: 0 10px 28px rgba(255, 56, 174, 0.34);
 }
 
 .play-cta::after {

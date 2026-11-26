@@ -1,8 +1,8 @@
 // STRIKE — 3D Camera Hand-Punch & Duck Arcade Game
 // Powered by shared on-device MediaPipe Pose Tracker & Web Audio Synth.
 
-import { SoundEngine } from '../../shared/audio.js?v=7';
-import { PoseTracker, UPPER_BODY_CONNECTIONS, ALIGN_BOUNDS } from '../../shared/tracker.js?v=7';
+import { SoundEngine } from '../../shared/audio.js?v=8';
+import { PoseTracker, UPPER_BODY_CONNECTIONS, ALIGN_BOUNDS } from '../../shared/tracker.js?v=8';
 
 const STORAGE_KEYS = {
   highScore: 'strike_high_score',

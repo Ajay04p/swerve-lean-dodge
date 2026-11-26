@@ -291,6 +291,118 @@ export class SoundEngine {
     });
   }
 
+  bladeSwing(intensity = 0.7) {
+    const k = Math.max(0.35, Math.min(1.2, intensity));
+    this._playNoise({
+      duration: 0.085,
+      gain: 0.075 * k,
+      filterType: 'bandpass',
+      freqStart: 1200 + 600 * k,
+      freqEnd: 2900 + 800 * k,
+    });
+    this._playTone({
+      type: 'sine',
+      freqStart: 220 + 90 * k,
+      freqEnd: 520 + 180 * k,
+      duration: 0.075,
+      gain: 0.045 * k,
+      attack: 0.004,
+    });
+  }
+
+  crystalSlice(combo = 1, multiCount = 1) {
+    const isMulti = multiCount >= 2;
+    this.vibrate(isMulti ? [14, 18, 22] : 14);
+    const semi = Math.min(combo - 1, 14) + Math.min(multiCount - 1, 4) * 2;
+    const scale = Math.pow(2, semi / 18);
+
+    // Crisp laser-blade zip
+    this._playNoise({
+      duration: 0.075,
+      gain: 0.13,
+      filterType: 'highpass',
+      freqStart: 2400,
+      freqEnd: 6200,
+    });
+
+    // Clean crystalline cleave shimmer
+    this._playTone({
+      type: 'triangle',
+      freqStart: 620 * scale,
+      freqEnd: 1240 * scale,
+      duration: 0.11,
+      gain: 0.17,
+      attack: 0.002,
+      filterFreq: 4800,
+    });
+
+    // Sub punch for physical tactile feel
+    this._playTone({
+      type: 'sine',
+      freqStart: 165,
+      freqEnd: 68,
+      duration: 0.09,
+      gain: 0.18,
+      attack: 0.002,
+    });
+
+    if (isMulti) {
+      this._playTone({
+        type: 'sine',
+        freqStart: 987.77 * scale,
+        freqEnd: 1479.98 * scale,
+        duration: 0.17,
+        delay: 0.035,
+        gain: 0.15,
+        attack: 0.003,
+      });
+    }
+  }
+
+  mineBlast() {
+    this.vibrate([55, 30, 75]);
+    this._playTone({
+      type: 'sawtooth',
+      freqStart: 150,
+      freqEnd: 34,
+      duration: 0.34,
+      gain: 0.28,
+      attack: 0.003,
+      filterFreq: 680,
+    });
+    this._playTone({
+      type: 'sine',
+      freqStart: 110,
+      freqEnd: 28,
+      duration: 0.36,
+      gain: 0.32,
+      attack: 0.002,
+    });
+    this._playNoise({
+      duration: 0.24,
+      gain: 0.26,
+      filterType: 'bandpass',
+      freqStart: 960,
+      freqEnd: 120,
+    });
+  }
+
+  frenzyStart() {
+    this.vibrate([18, 24, 18, 24, 30]);
+    const notes = [523.25, 659.25, 783.99, 1046.5, 1318.51];
+    notes.forEach((f, idx) => {
+      this._playTone({
+        type: idx % 2 === 0 ? 'triangle' : 'sine',
+        freqStart: f,
+        freqEnd: f * 1.03,
+        duration: 0.2,
+        delay: idx * 0.045,
+        gain: 0.15,
+        attack: 0.004,
+      });
+    });
+  }
+
   closeCall(combo = 1) {
     this.vibrate(18);
     const shift = Math.min(combo - 1, 8) * 20;

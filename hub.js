@@ -1,6 +1,7 @@
 // MOTION ARCADE HUB — Ambient 3D backdrop, high-score sync, and shared camera toggle
 
 const KEYS = {
+  slashBest: 'slash_high_score',
   swerveBest: 'swerve_high_score',
   strikeBest: 'strike_high_score',
   cameraFacing: 'swerve_camera_facing',
@@ -32,14 +33,19 @@ function writeStr(key, value) {
 }
 
 function initHubUI() {
+  const slashBest = readInt(KEYS.slashBest);
   const swerveBest = readInt(KEYS.swerveBest);
   const strikeBest = readInt(KEYS.strikeBest);
-  const totalBest = swerveBest + strikeBest;
+  const totalBest = slashBest + swerveBest + strikeBest;
 
+  const slashBadge = document.getElementById('badge-best-slash');
   const swerveBadge = document.getElementById('badge-best-swerve');
   const strikeBadge = document.getElementById('badge-best-strike');
   const totalPill = document.getElementById('total-score-pill');
 
+  if (slashBadge) {
+    slashBadge.textContent = slashBest > 0 ? `BEST ${slashBest.toLocaleString()}` : 'NEW';
+  }
   if (swerveBadge) {
     swerveBadge.textContent = swerveBest > 0 ? `BEST ${swerveBest.toLocaleString()}` : 'NEW';
   }

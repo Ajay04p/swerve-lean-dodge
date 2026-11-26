@@ -1241,3 +1241,36 @@ body {
     0 10px 28px rgba(50, 230, 255, 0.32),
     inset 0 1px 0 rgba(255, 255, 255, 0.55);
 }
+
+.mech-dot.magenta {
+  background: #ff38ae;
+  box-shadow: 0 0 8px #ff38ae;
+}
+
+/* Plasma neon magenta + cyan accent variant for SLASH */
+.theme-plasma .hero-kicker {
+  color: rgba(255, 96, 198, 0.94);
+}
+
+.theme-plasma .hero-slash {
+  background: linear-gradient(90deg, transparent 0%, #ff38ae 34%, var(--cyan) 100%);
+  box-shadow: 0 0 20px rgba(255, 56, 174, 0.72);
+}
+
+.theme-plasma .hero-dock {
+  border-top-color: rgba(255, 56, 174, 0.48);
+}
+
+.theme-plasma .btn-primary {
+  background: linear-gradient(135deg, #ff70c8 0%, #ff38ae 52%, #c822ff 100%);
+  color: #160410;
+  box-shadow:
+    0 10px 30px rgba(255, 56, 174, 0.34),
+    inset 0 1px 0 rgba(255, 255, 255, 0.52);
+}
+
+.theme-plasma .seg-btn.active {
+  background: linear-gradient(135deg, #ff58bc 0%, #32e6ff 100%);
+  color: #07090c;
+}
+

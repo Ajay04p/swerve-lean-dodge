@@ -112,6 +112,21 @@ export class PoseTracker {
       left: { visible: false, x: 0, y: 0, nx: 0.25, ny: 0.55, vx: 0, vy: 0, speed: 0 },
       right: { visible: false, x: 0, y: 0, nx: 0.75, ny: 0.55, vx: 0, vy: 0, speed: 0 },
     };
+
+    // Real-time Human Segmentation / Neon Hologram buffers
+    this.segmentationEnabled = false;
+    this.hasMask = false;
+    this._maskW = 0;
+    this._maskH = 0;
+    this._maskFloats = null;
+    this._holoCanvas = null;
+    this._holoCtx = null;
+    this._holoImg = null;
+    this._alphaCanvas = null;
+    this._alphaCtx = null;
+    this._alphaImg = null;
+    this._cutoutCanvas = null;
+    this._cutoutCtx = null;
   }
 
   setSensitivity(mode) {
@@ -124,8 +139,9 @@ export class PoseTracker {
     this.mirrored = Boolean(mirrored);
   }
 
-  async initModel(onStatus = () => {}) {
-    if (this.poseLandmarker) {
+  async initModel(onStatus = () => {}, options = {}) {
+    const wantSeg = Boolean(options.segmentation);
+    if (this.poseLandmarker && (!wantSeg || this.segmentationEnabled)) {
       this.ready = true;
       return this.delegate;
     }
@@ -143,10 +159,11 @@ export class PoseTracker {
       minPoseDetectionConfidence: 0.45,
       minPosePresenceConfidence: 0.45,
       minTrackingConfidence: 0.45,
+      outputSegmentationMasks: wantSeg,
     };
 
     try {
-      onStatus('Loading Pose model (GPU)…');
+      onStatus(wantSeg ? 'Loading Hologram Pose model (GPU)…' : 'Loading Pose model (GPU)…');
       this.poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
         ...commonOptions,
         baseOptions: {
@@ -155,17 +172,34 @@ export class PoseTracker {
         },
       });
       this.delegate = 'GPU';
+      this.segmentationEnabled = wantSeg;
     } catch (gpuErr) {
       console.warn('[ARCADE] GPU delegate unavailable, falling back to CPU:', gpuErr);
       onStatus('Switching Pose model to CPU…');
-      this.poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
-        ...commonOptions,
-        baseOptions: {
-          modelAssetPath: POSE_MODEL_URL,
-          delegate: 'CPU',
-        },
-      });
-      this.delegate = 'CPU';
+      try {
+        this.poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
+          ...commonOptions,
+          baseOptions: {
+            modelAssetPath: POSE_MODEL_URL,
+            delegate: 'CPU',
+          },
+        });
+        this.delegate = 'CPU';
+        this.segmentationEnabled = wantSeg;
+      } catch (cpuErr) {
+        if (!wantSeg) throw cpuErr;
+        // Fallback without segmentation mask if device cannot allocate it
+        this.poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
+          ...commonOptions,
+          outputSegmentationMasks: false,
+          baseOptions: {
+            modelAssetPath: POSE_MODEL_URL,
+            delegate: 'CPU',
+          },
+        });
+        this.delegate = 'CPU';
+        this.segmentationEnabled = false;
+      }
     }
 
     this.ready = true;
@@ -315,6 +349,10 @@ export class PoseTracker {
     this.hands.left.visible = false;
     this.hands.right.visible = false;
     this.mappedLandmarks = null;
+    this.hasMask = false;
+    this._maskW = 0;
+    this._maskH = 0;
+    this._maskFloats = null;
   }
 
   startCalibration() {
@@ -448,6 +486,21 @@ export class PoseTracker {
         console.warn('[ARCADE] Pose detect frame skipped:', err);
       }
 
+      if (this.segmentationEnabled && result?.segmentationMasks?.length) {
+        const mask = result.segmentationMasks[0];
+        try {
+          this._captureSegmentationMask(mask);
+        } catch (maskErr) {
+          console.warn('[ARCADE] Segmentation mask frame skipped:', maskErr);
+        } finally {
+          try {
+            mask.close();
+          } catch {
+            // Ignore close errors
+          }
+        }
+      }
+
       const rawLandmarks = result?.landmarks?.[0];
       if (rawLandmarks && rawLandmarks.length >= 17) {
         this._processLandmarks(rawLandmarks, video.videoWidth, video.videoHeight, viewW, viewH, dtSec);
@@ -456,6 +509,7 @@ export class PoseTracker {
         if (this.poseLostTimer > 0.35) {
           this.hasPose = false;
           this.hasFullUpperBody = false;
+          this.hasMask = false;
           this.hands.left.visible = false;
           this.hands.right.visible = false;
           this.mappedLandmarks = null;
@@ -747,6 +801,247 @@ export class PoseTracker {
     return clamp((dx / baseSwayW) * mult, -1, 1);
   }
 
+  _captureSegmentationMask(mask) {
+    if (!mask || typeof mask.getAsFloat32Array !== 'function') return;
+    const srcW = mask.width | 0;
+    const srcH = mask.height | 0;
+    if (srcW <= 0 || srcH <= 0) return;
+
+    const raw = mask.getAsFloat32Array();
+    if (!raw || raw.length < srcW * srcH) return;
+
+    const step = Math.max(1, Math.floor(srcW / 160));
+    const dstW = Math.max(1, Math.floor(srcW / step));
+    const dstH = Math.max(1, Math.floor(srcH / step));
+    const total = dstW * dstH;
+
+    const sameDims = this._maskFloats && this._maskW === dstW && this._maskH === dstH;
+    if (!sameDims) {
+      this._maskFloats = new Float32Array(total);
+      this._maskW = dstW;
+      this._maskH = dstH;
+    }
+
+    const dst = this._maskFloats;
+    if (sameDims) {
+      // Subtle temporal EMA removes hair/edge shimmer while preserving fast hand motion
+      for (let y = 0; y < dstH; y++) {
+        const srcRow = y * step * srcW;
+        const dstRow = y * dstW;
+        for (let x = 0; x < dstW; x++) {
+          const v = raw[srcRow + x * step];
+          const i = dstRow + x;
+          dst[i] = dst[i] * 0.28 + v * 0.72;
+        }
+      }
+    } else {
+      for (let y = 0; y < dstH; y++) {
+        const srcRow = y * step * srcW;
+        const dstRow = y * dstW;
+        for (let x = 0; x < dstW; x++) {
+          dst[dstRow + x] = raw[srcRow + x * step];
+        }
+      }
+    }
+
+    this.hasMask = true;
+  }
+
+  getVideoCoverRect(viewW, viewH) {
+    const vidW = this.videoEl?.videoWidth || this._maskW || viewW;
+    const vidH = this.videoEl?.videoHeight || this._maskH || viewH;
+    const vidAspect = vidW / Math.max(1, vidH);
+    const viewAspect = viewW / Math.max(1, viewH);
+
+    if (vidAspect > viewAspect) {
+      const dh = viewH;
+      const dw = viewH * vidAspect;
+      return { dx: (viewW - dw) * 0.5, dy: 0, dw, dh };
+    }
+    const dw = viewW;
+    const dh = viewW / Math.max(0.01, vidAspect);
+    return { dx: 0, dy: (viewH - dh) * 0.5, dw, dh };
+  }
+
+  _ensureOffscreen(propCanvas, propCtx, propImg, w, h) {
+    if (!this[propCanvas]) {
+      if (typeof document === 'undefined') return false;
+      this[propCanvas] = document.createElement('canvas');
+      this[propCtx] = this[propCanvas].getContext('2d', { willReadFrequently: false });
+    }
+    const c = this[propCanvas];
+    if (!c || !this[propCtx]) return false;
+    if (c.width !== w || c.height !== h) {
+      c.width = w;
+      c.height = h;
+      if (propImg) {
+        this[propImg] = this[propCtx].createImageData(w, h);
+      }
+    }
+    return true;
+  }
+
+  drawHumanLayer(ctx, viewW, viewH, options = {}) {
+    if (!this.hasMask || !this._maskFloats || this._maskW <= 1 || this._maskH <= 1) {
+      return false;
+    }
+
+    const mode = options.mode === 'cutout' ? 'cutout' : 'hologram';
+    const accentRgb = options.accentRgb || [50, 230, 255];
+    const secondaryRgb = options.secondaryRgb || [255, 56, 174];
+    const nowMs = options.nowMs || 0;
+    const bodyOpacity = options.bodyOpacity ?? 1;
+
+    const mw = this._maskW;
+    const mh = this._maskH;
+    const mask = this._maskFloats;
+
+    if (!this._ensureOffscreen('_holoCanvas', '_holoCtx', '_holoImg', mw, mh)) {
+      return false;
+    }
+
+    const holoData = this._holoImg.data;
+    let alphaData = null;
+    if (mode === 'cutout') {
+      if (!this._ensureOffscreen('_alphaCanvas', '_alphaCtx', '_alphaImg', mw, mh)) {
+        return false;
+      }
+      alphaData = this._alphaImg.data;
+    }
+
+    const phase = nowMs * 0.0085;
+    const [r1, g1, b1] = accentRgb;
+    const [r2, g2, b2] = secondaryRgb;
+
+    for (let y = 0; y < mh; y++) {
+      const ty = y / mh;
+      const mixR = r1 + (r2 - r1) * ty;
+      const mixG = g1 + (g2 - g1) * ty;
+      const mixB = b1 + (b2 - b1) * ty;
+      const scan = 0.78 + 0.22 * Math.sin(y * 1.1 - phase);
+
+      const yUp = y > 0 ? y - 1 : 0;
+      const yDn = y < mh - 1 ? y + 1 : mh - 1;
+      const row = y * mw;
+      const rowUp = yUp * mw;
+      const rowDn = yDn * mw;
+
+      for (let x = 0; x < mw; x++) {
+        const idx = row + x;
+        const p = mask[idx];
+        const xL = x > 0 ? x - 1 : 0;
+        const xR = x < mw - 1 ? x + 1 : mw - 1;
+
+        const gx = mask[row + xR] - mask[row + xL];
+        const gy = mask[rowDn + x] - mask[rowUp + x];
+        const grad = Math.min(1, Math.hypot(gx, gy) * 1.9);
+
+        // Soft body matte
+        let body = (p - 0.36) * 2.94;
+        if (body < 0) body = 0;
+        else if (body > 1) body = 1;
+
+        // Sharp electric contour along silhouette boundary (works for both crisp and soft masks)
+        const rimSignal = p > 0.12 ? grad : grad * 0.55;
+        const rim = rimSignal > 0.14 ? Math.min(1, (rimSignal - 0.14) * 1.55) : 0;
+
+        const o = idx * 4;
+        if (mode === 'hologram') {
+          if (body <= 0.01 && rim <= 0.01) {
+            holoData[o] = 0;
+            holoData[o + 1] = 0;
+            holoData[o + 2] = 0;
+            holoData[o + 3] = 0;
+          } else {
+            // Cyber translucent interior + blazing neon white-core outline
+            const coreR = mixR * 0.34 * scan;
+            const coreG = mixG * 0.38 * scan;
+            const coreB = mixB * 0.5 * scan;
+
+            const rimR = mixR + (255 - mixR) * rim * 0.55;
+            const rimG = mixG + (255 - mixG) * rim * 0.55;
+            const rimB = mixB + (255 - mixB) * rim * 0.55;
+
+            holoData[o] = Math.min(255, coreR * (1 - rim) + rimR * rim);
+            holoData[o + 1] = Math.min(255, coreG * (1 - rim) + rimG * rim);
+            holoData[o + 2] = Math.min(255, coreB * (1 - rim) + rimB * rim);
+            holoData[o + 3] = Math.min(255, Math.max(body * 148, rim * 255));
+          }
+        } else {
+          // Real Cutout mode: soft alpha mask + pure neon rim overlay
+          alphaData[o] = 255;
+          alphaData[o + 1] = 255;
+          alphaData[o + 2] = 255;
+          alphaData[o + 3] = Math.round(body * 255);
+
+          if (rim <= 0.01) {
+            holoData[o] = 0;
+            holoData[o + 1] = 0;
+            holoData[o + 2] = 0;
+            holoData[o + 3] = 0;
+          } else {
+            holoData[o] = Math.min(255, mixR + (255 - mixR) * rim * 0.5);
+            holoData[o + 1] = Math.min(255, mixG + (255 - mixG) * rim * 0.5);
+            holoData[o + 2] = Math.min(255, mixB + (255 - mixB) * rim * 0.5);
+            holoData[o + 3] = Math.round(rim * 245);
+          }
+        }
+      }
+    }
+
+    this._holoCtx.putImageData(this._holoImg, 0, 0);
+    const { dx, dy, dw, dh } = this.getVideoCoverRect(viewW, viewH);
+
+    ctx.save();
+    if (this.mirrored) {
+      ctx.translate(viewW, 0);
+      ctx.scale(-1, 1);
+    }
+    ctx.imageSmoothingEnabled = true;
+
+    if (mode === 'hologram') {
+      ctx.globalAlpha = 0.92 * bodyOpacity;
+      ctx.drawImage(this._holoCanvas, dx, dy, dw, dh);
+
+      // Additive neon bloom pass
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.globalAlpha = 0.52 * bodyOpacity;
+      ctx.drawImage(this._holoCanvas, dx, dy, dw, dh);
+    } else if (this.videoEl && this.videoEl.readyState >= 2 && this.videoEl.videoWidth > 0) {
+      this._alphaCtx.putImageData(this._alphaImg, 0, 0);
+      const cw = Math.max(160, Math.min(540, Math.round(viewW * 0.55)));
+      const ch = Math.max(160, Math.round((cw / Math.max(1, viewW)) * viewH));
+      if (this._ensureOffscreen('_cutoutCanvas', '_cutoutCtx', null, cw, ch)) {
+        const sx = cw / Math.max(1, viewW);
+        const sy = ch / Math.max(1, viewH);
+        const cctx = this._cutoutCtx;
+        cctx.globalCompositeOperation = 'source-over';
+        cctx.clearRect(0, 0, cw, ch);
+        cctx.imageSmoothingEnabled = true;
+        cctx.drawImage(this.videoEl, dx * sx, dy * sy, dw * sx, dh * sy);
+        cctx.globalCompositeOperation = 'destination-in';
+        cctx.drawImage(this._alphaCanvas, dx * sx, dy * sy, dw * sx, dh * sy);
+        cctx.globalCompositeOperation = 'source-over';
+
+        ctx.globalAlpha = 0.94 * bodyOpacity;
+        ctx.drawImage(this._cutoutCanvas, 0, 0, viewW, viewH);
+      }
+
+      // Glowing neon silhouette outline around the real human cutout
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.globalAlpha = 0.88 * bodyOpacity;
+      ctx.drawImage(this._holoCanvas, dx, dy, dw, dh);
+    } else {
+      // Fallback to hologram rim if video isn't ready
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.globalAlpha = 0.78 * bodyOpacity;
+      ctx.drawImage(this._holoCanvas, dx, dy, dw, dh);
+    }
+
+    ctx.restore();
+    return true;
+  }
+
   getState() {
     const thresholds = this.getDuckThresholdsNormH();
     return {
@@ -755,6 +1050,8 @@ export class PoseTracker {
       facingMode: this.facingMode,
       mirrored: this.mirrored,
       delegate: this.delegate,
+      segmentationEnabled: this.segmentationEnabled,
+      hasMask: this.hasMask,
       hasPose: this.hasPose,
       hasFullUpperBody: this.hasFullUpperBody,
       alignment: this.alignment,

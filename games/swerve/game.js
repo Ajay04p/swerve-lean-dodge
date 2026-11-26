@@ -1,7 +1,7 @@
 // SWERVE — 3D Perspective Lean & Dodge engine, renderer, controls, and UI
 
-import { SoundEngine } from '../../shared/audio.js?v=7';
-import { PoseTracker, UPPER_BODY_CONNECTIONS, ALIGN_BOUNDS } from '../../shared/tracker.js?v=7';
+import { SoundEngine } from '../../shared/audio.js?v=8';
+import { PoseTracker, UPPER_BODY_CONNECTIONS, ALIGN_BOUNDS } from '../../shared/tracker.js?v=8';
 
 const STORAGE_KEYS = {
   highScore: 'swerve_high_score',

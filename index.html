@@ -4,12 +4,12 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <meta name="theme-color" content="#07090c" />
-  <meta name="description" content="Free on-device phone-camera 3D motion arcade games. Play SWERVE and STRIKE instantly in your browser with zero installs and 100% camera privacy." />
+  <meta name="description" content="Free on-device phone-camera 3D motion arcade games. Play SLASH, SWERVE, and STRIKE instantly in your browser with Real Human Neon Hologram visuals, zero installs, and 100% camera privacy." />
   <title>MOTION ARCADE — Free Camera Games</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:ital,wght@0,600;0,700;1,700&family=JetBrains+Mono:wght@500;700&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="./hub.css?v=7" />
+  <link rel="stylesheet" href="./hub.css?v=8" />
 </head>
 <body>
   <canvas id="hub-bg-canvas" class="hub-bg-canvas" aria-hidden="true"></canvas>
@@ -39,18 +39,75 @@
       <h1 class="hub-title">PLAY WITH YOUR BODY.</h1>
       <div class="hub-slash" aria-hidden="true"></div>
       <p class="hub-desc">
-        Step in front of your phone camera—lean, duck, and punch through 3D neon arenas powered 100% on-device. Every game also includes Touch &amp; Keyboard Practice Mode.
+        Step in front of your phone camera—become a real neon hologram, slice 3D crystals, lean through tunnels, and punch targets 100% on-device. Every game includes Touch &amp; Keyboard Practice Mode.
       </p>
     </section>
 
     <main>
       <div class="section-head">
         <h2 class="section-title">PLAYABLE NOW</h2>
-        <span class="section-meta">2 Games Live</span>
+        <span class="section-meta">3 Games Live</span>
       </div>
 
       <div class="games-grid">
-        <!-- Game 1: SWERVE -->
+        <!-- Game 1: SLASH (Featured New Hologram Game) -->
+        <article class="game-card card-plasma">
+          <div class="card-art art-slash">
+            <span class="card-live-badge">NEW · HOLOGRAM</span>
+            <span id="badge-best-slash" class="card-best-badge tabular">NEW</span>
+            <svg viewBox="0 0 400 180" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+              <!-- Cyber horizon floor lines -->
+              <path d="M0 132 L400 132 M200 132 L24 180 M200 132 L376 180 M200 132 L118 180 M200 132 L282 180" stroke="#ff38ae" stroke-opacity="0.28" stroke-width="1.4" />
+              <!-- Glowing Real Human Neon Hologram Silhouette -->
+              <path d="M200 44 C211 44 218 52 218 63 C218 72 212 79 206 81 L234 94 L274 72 L281 82 L238 110 L226 112 L230 162 L170 162 L174 112 L162 110 L122 86 L128 75 L166 94 L194 81 C188 79 182 72 182 63 C182 52 189 44 200 44 Z" fill="url(#holoFill)" stroke="url(#holoRim)" stroke-width="2.4" />
+              <!-- Cleaved 3D wireframe octahedron halves -->
+              <g transform="translate(106 66) rotate(-24)">
+                <path d="M0 -30 L26 -4 L-26 -4 Z" stroke="#32e6ff" stroke-width="2.2" fill="#32e6ff" fill-opacity="0.16" />
+                <path d="M-24 -4 L24 -4" stroke="#ffffff" stroke-width="2.5" />
+                <path d="M0 34 L26 8 L-26 8 Z" stroke="#32e6ff" stroke-width="2.2" fill="#32e6ff" fill-opacity="0.14" />
+              </g>
+              <!-- Glowing Plasma Blade Arc -->
+              <path d="M52 114 Q112 68 172 34" stroke="#ff38ae" stroke-opacity="0.45" stroke-width="12" stroke-linecap="round" />
+              <path d="M52 114 Q112 68 172 34" stroke="#ffffff" stroke-width="3" stroke-linecap="round" />
+              <!-- Right-hand Cyan Blade Arc + Star Core -->
+              <path d="M254 88 Q304 62 350 38" stroke="#32e6ff" stroke-opacity="0.45" stroke-width="10" stroke-linecap="round" />
+              <path d="M254 88 Q304 62 350 38" stroke="#ffffff" stroke-width="2.5" stroke-linecap="round" />
+              <polygon points="312,92 332,112 312,132 292,112" stroke="#ffb82e" stroke-width="2.2" fill="#ffb82e" fill-opacity="0.2" />
+              <defs>
+                <linearGradient id="holoFill" x1="200" y1="44" x2="200" y2="162" gradientUnits="userSpaceOnUse">
+                  <stop stop-color="#32e6ff" stop-opacity="0.26" />
+                  <stop offset="1" stop-color="#ff38ae" stop-opacity="0.18" />
+                </linearGradient>
+                <linearGradient id="holoRim" x1="122" y1="44" x2="281" y2="162" gradientUnits="userSpaceOnUse">
+                  <stop stop-color="#32e6ff" />
+                  <stop offset="1" stop-color="#ff38ae" />
+                </linearGradient>
+              </defs>
+            </svg>
+          </div>
+
+          <div class="card-body">
+            <div class="card-title-row">
+              <h3 class="card-title">SLASH</h3>
+              <span class="card-mode">LASER BLADES</span>
+            </div>
+            <p class="card-desc">
+              Step into a dark cyber dojo as a glowing Real Human Neon Hologram. Swing both hands to slice 3D wireframe polyhedra cleanly in half along your exact blade angle while dodging red spike mines.
+            </p>
+            <div class="tag-row">
+              <span class="tag">HUMAN HOLOGRAM</span>
+              <span class="tag">REAL CUTOUT</span>
+              <span class="tag">VECTOR SLICE</span>
+              <span class="tag">FRENZY 2×</span>
+            </div>
+            <a class="play-cta cta-plasma" href="./games/slash/?v=8">
+              <span>PLAY SLASH</span>
+              <span aria-hidden="true">→</span>
+            </a>
+          </div>
+        </article>
+
+        <!-- Game 2: SWERVE -->
         <article class="game-card card-volt">
           <div class="card-art art-swerve">
             <span class="card-live-badge">3D TUNNEL</span>
@@ -89,14 +146,14 @@
               <span class="tag">4 ZONES</span>
               <span class="tag">FRONT / BACK CAM</span>
             </div>
-            <a class="play-cta cta-volt" href="./games/swerve/?v=7">
+            <a class="play-cta cta-volt" href="./games/swerve/?v=8">
               <span>PLAY SWERVE</span>
               <span aria-hidden="true">→</span>
             </a>
           </div>
         </article>
 
-        <!-- Game 2: STRIKE -->
+        <!-- Game 3: STRIKE -->
         <article class="game-card card-cyan">
           <div class="card-art art-strike">
             <span class="card-live-badge">HAND ACTION</span>
@@ -133,7 +190,7 @@
               <span class="tag">DUCK LASERS</span>
               <span class="tag">TAP / KEYS FALLBACK</span>
             </div>
-            <a class="play-cta cta-cyan" href="./games/strike/?v=7">
+            <a class="play-cta cta-cyan" href="./games/strike/?v=8">
               <span>PLAY STRIKE</span>
               <span aria-hidden="true">→</span>
             </a>
@@ -166,11 +223,11 @@
     </main>
 
     <footer class="hub-footer">
-      <span>100% On-Device MediaPipe Pose · Camera feed never leaves your device</span>
+      <span>100% On-Device MediaPipe Pose &amp; Segmentation · Camera feed never leaves your device</span>
       <span>Free Web Arcade · iOS Safari, Android Chrome &amp; Desktop</span>
     </footer>
   </div>
 
-  <script type="module" src="./hub.js?v=7"></script>
+  <script type="module" src="./hub.js?v=8"></script>
 </body>
 </html>
