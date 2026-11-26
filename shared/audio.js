@@ -1,4 +1,4 @@
-// SWERVE — Zero-asset Web Audio API arcade synthesizer + mobile haptics
+// MOTION ARCADE — Shared zero-asset Web Audio API synthesizer + mobile haptics
 // Unlocked on first user tap for iOS Safari / mobile browser compatibility.
 
 const STORAGE_MUTE_KEY = 'swerve_muted';
@@ -56,7 +56,7 @@ export class SoundEngine {
         navigator.vibrate(pattern);
       }
     } catch {
-      // Ignore on unsupported devices (e.g. iOS Safari)
+      // Ignore on unsupported devices
     }
   }
 
@@ -188,8 +188,7 @@ export class SoundEngine {
   }
 
   beatPulse(zoneIndex = 0, combo = 1, isDownbeat = false) {
-    // Subtle rhythmic synth bass pulse that builds energy as combo climbs
-    const roots = [55, 61.74, 65.41, 73.42]; // A1, B1, C2, D2
+    const roots = [55, 61.74, 65.41, 73.42];
     const root = roots[zoneIndex % roots.length];
     const freq = isDownbeat ? root : root * 1.5;
     const energy = Math.min(1, 0.35 + (combo - 1) * 0.08);
@@ -235,6 +234,63 @@ export class SoundEngine {
     });
   }
 
+  punchSmash(combo = 1, isPerfect = false) {
+    this.vibrate(isPerfect ? 24 : 16);
+    const boost = Math.pow(2, Math.min(combo - 1, 10) / 18);
+    // Low punch thump
+    this._playTone({
+      type: 'sine',
+      freqStart: 180,
+      freqEnd: 58,
+      duration: 0.12,
+      gain: 0.24,
+      attack: 0.002,
+    });
+    // Crystalline shatter chime
+    this._playTone({
+      type: 'triangle',
+      freqStart: 520 * boost,
+      freqEnd: (isPerfect ? 1040 : 780) * boost,
+      duration: 0.13,
+      gain: 0.18,
+      attack: 0.003,
+      filterFreq: 3600,
+    });
+    if (isPerfect) {
+      this._playTone({
+        type: 'sine',
+        freqStart: 1046.5 * boost,
+        freqEnd: 1396.9 * boost,
+        duration: 0.16,
+        delay: 0.035,
+        gain: 0.14,
+        attack: 0.003,
+      });
+    }
+    this._playNoise({
+      duration: 0.09,
+      gain: 0.14,
+      filterType: 'bandpass',
+      freqStart: 2400,
+      freqEnd: 900,
+    });
+  }
+
+  doubleSmash(combo = 1) {
+    this.vibrate([18, 22, 26]);
+    this.punchSmash(combo, true);
+    this._playTone({
+      type: 'sawtooth',
+      freqStart: 440,
+      freqEnd: 880,
+      duration: 0.18,
+      delay: 0.04,
+      gain: 0.1,
+      attack: 0.004,
+      filterFreq: 2800,
+    });
+  }
+
   closeCall(combo = 1) {
     this.vibrate(18);
     const shift = Math.min(combo - 1, 8) * 20;
@@ -260,7 +316,7 @@ export class SoundEngine {
   goldRing(combo = 1) {
     this.vibrate(14);
     const pitchScale = Math.pow(2, Math.min(combo - 1, 6) / 24);
-    const notes = [659.25, 987.77, 1318.51, 1567.98]; // E5, B5, E6, G6
+    const notes = [659.25, 987.77, 1318.51, 1567.98];
     notes.forEach((freq, idx) => {
       this._playTone({
         type: idx === 3 ? 'triangle' : 'sine',
@@ -294,7 +350,7 @@ export class SoundEngine {
 
   zoneUp() {
     this.vibrate([15, 30, 25]);
-    const notes = [440, 554.37, 659.25, 880]; // A major power surge
+    const notes = [440, 554.37, 659.25, 880];
     notes.forEach((f, idx) => {
       this._playTone({
         type: 'sawtooth',

@@ -1,7 +1,7 @@
-// SWERVE — On-device MediaPipe Pose Landmarker tracker
-// Handles front camera capture, GPU->CPU delegate fallback, mirrored cover-fit
-// projection, weighted Nose + Mid-Shoulders EMA tracking, alignment gating,
-// and 1.4s neutral posture calibration.
+// MOTION ARCADE — Shared on-device MediaPipe Pose Landmarker tracker
+// Supports Front/Back cameras, multi-lens selection, GPU->CPU delegate fallback,
+// cover-fit projection, weighted Nose + Mid-Shoulders EMA tracking, alignment-gated
+// 1.4s calibration, duck hysteresis, shoulder tilt, and live left/right hand tracking.
 
 const MEDIAPIPE_ESM_URL = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision/vision_bundle.mjs';
 const MEDIAPIPE_WASM_URL = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision/wasm';
@@ -19,7 +19,7 @@ export const UPPER_BODY_CONNECTIONS = [
   [23, 24], // hips
 ];
 
-export const UPPER_BODY_LANDMARKS = [0, 11, 12, 13, 14, 15, 16, 23, 24];
+export const UPPER_BODY_LANDMARKS = [0, 11, 12, 13, 14, 15, 16, 19, 20, 23, 24];
 
 const SENSITIVITY_MULTIPLIERS = {
   gentle: 1.4,
@@ -31,7 +31,6 @@ const CALIBRATION_DURATION_MS = 1400;
 const MIN_VISIBILITY = 0.35;
 const ALIGN_VISIBILITY = 0.42;
 
-// Alignment target window (normalized viewport coordinates)
 export const ALIGN_BOUNDS = {
   centerX: 0.5,
   centerY: 0.42,
@@ -102,19 +101,27 @@ export class PoseTracker {
     this.isDucked = false;
     this.duckProgress = 0;
 
-    // Latest mapped viewport landmarks for skeleton overlay & avatar body
+    // Mapped landmarks, avatar pose, and live fist/hand tracking
     this.mappedLandmarks = null;
     this.trackedPointPx = null;
     this.midShoulderPx = null;
     this.nosePx = null;
-    this.shoulderTilt = 0; // radians, + leans screen-right
-    this.avatarArms = { left: null, right: null }; // normalized shoulder-to-elbow/wrist vectors
+    this.shoulderTilt = 0;
+    this.avatarArms = { left: null, right: null };
+    this.hands = {
+      left: { visible: false, x: 0, y: 0, nx: 0.25, ny: 0.55, vx: 0, vy: 0, speed: 0 },
+      right: { visible: false, x: 0, y: 0, nx: 0.75, ny: 0.55, vx: 0, vy: 0, speed: 0 },
+    };
   }
 
   setSensitivity(mode) {
     if (SENSITIVITY_MULTIPLIERS[mode]) {
       this.sensitivity = mode;
     }
+  }
+
+  setMirror(mirrored) {
+    this.mirrored = Boolean(mirrored);
   }
 
   async initModel(onStatus = () => {}) {
@@ -149,7 +156,7 @@ export class PoseTracker {
       });
       this.delegate = 'GPU';
     } catch (gpuErr) {
-      console.warn('[SWERVE] GPU delegate unavailable, falling back to CPU:', gpuErr);
+      console.warn('[ARCADE] GPU delegate unavailable, falling back to CPU:', gpuErr);
       onStatus('Switching Pose model to CPU…');
       this.poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
         ...commonOptions,
@@ -163,10 +170,6 @@ export class PoseTracker {
 
     this.ready = true;
     return this.delegate;
-  }
-
-  setMirror(mirrored) {
-    this.mirrored = Boolean(mirrored);
   }
 
   async listCameras() {
@@ -212,7 +215,6 @@ export class PoseTracker {
       attempts.push({ audio: false, video: { ...baseVideo, deviceId: { exact: deviceId } } });
     }
     if (facingMode === 'environment') {
-      // Try exact rear camera first on mobile so iOS/Android reliably switches off the selfie lens
       attempts.push({ audio: false, video: { ...baseVideo, facingMode: { exact: 'environment' } } });
       attempts.push({ audio: false, video: { ...baseVideo, facingMode: { ideal: 'environment' } } });
     } else {
@@ -227,7 +229,6 @@ export class PoseTracker {
         break;
       } catch (err) {
         lastErr = err;
-        // Don't retry on permission denial or busy camera
         if (err && (err.name === 'NotAllowedError' || err.name === 'NotReadableError')) {
           break;
         }
@@ -248,7 +249,6 @@ export class PoseTracker {
       throw new Error(err?.message || `Unable to access ${camName}.`);
     }
 
-    // Read back actual track settings (deviceId & facingMode if exposed)
     const videoTrack = stream.getVideoTracks()[0];
     const trackSettings = videoTrack?.getSettings?.() || {};
     if (trackSettings.deviceId) {
@@ -312,6 +312,8 @@ export class PoseTracker {
     this.motionSpeed = 0;
     this.shoulderTilt = 0;
     this.avatarArms = { left: null, right: null };
+    this.hands.left.visible = false;
+    this.hands.right.visible = false;
     this.mappedLandmarks = null;
   }
 
@@ -348,7 +350,6 @@ export class PoseTracker {
   }
 
   getDuckThresholdsNormH() {
-    // Auto-scaled from calibrated shoulder span so both standing and desk play work cleanly
     const enterDrop = clamp(this.neutralSpanH * 0.4, 0.056, 0.155);
     const exitDrop = enterDrop * 0.68;
     return {
@@ -359,10 +360,6 @@ export class PoseTracker {
     };
   }
 
-  /**
-   * Maps a raw MediaPipe normalized landmark (0..1 in video space) into cover-fit
-   * viewport pixel coordinates matching `<video>` (mirrored for front, unmirrored for back).
-   */
   _mapLandmark(lm, vidW, vidH, viewW, viewH) {
     const vidAspect = vidW / vidH;
     const viewAspect = viewW / viewH;
@@ -395,82 +392,33 @@ export class PoseTracker {
 
   _evaluateAlignment() {
     if (!this.hasPose) {
-      return {
-        aligned: false,
-        reason: 'no_pose',
-        hint: 'Step into frame · show head & shoulders',
-      };
+      return { aligned: false, reason: 'no_pose', hint: 'Step into frame · show head & shoulders' };
     }
-
     if (!this.hasFullUpperBody) {
-      return {
-        aligned: false,
-        reason: 'missing_shoulders',
-        hint: 'Keep head & both shoulders inside frame',
-      };
+      return { aligned: false, reason: 'missing_shoulders', hint: 'Keep head & both shoulders inside frame' };
     }
-
     if (this.smoothSpanW < ALIGN_BOUNDS.minSpanW) {
-      return {
-        aligned: false,
-        reason: 'too_far',
-        hint: 'Move slightly closer to camera',
-      };
+      return { aligned: false, reason: 'too_far', hint: 'Move slightly closer to camera' };
     }
-
     if (this.smoothSpanW > ALIGN_BOUNDS.maxSpanW) {
-      return {
-        aligned: false,
-        reason: 'too_close',
-        hint: 'Step back slightly from camera',
-      };
+      return { aligned: false, reason: 'too_close', hint: 'Step back slightly from camera' };
     }
-
     if (this.smoothX < ALIGN_BOUNDS.centerX - ALIGN_BOUNDS.halfW) {
-      return {
-        aligned: false,
-        reason: 'move_right',
-        hint: 'Move slightly right to center →',
-      };
+      return { aligned: false, reason: 'move_right', hint: 'Move slightly right to center →' };
     }
-
     if (this.smoothX > ALIGN_BOUNDS.centerX + ALIGN_BOUNDS.halfW) {
-      return {
-        aligned: false,
-        reason: 'move_left',
-        hint: '← Move slightly left to center',
-      };
+      return { aligned: false, reason: 'move_left', hint: '← Move slightly left to center' };
     }
-
     if (this.smoothY < ALIGN_BOUNDS.minY) {
-      return {
-        aligned: false,
-        reason: 'too_high',
-        hint: 'Lower head or tilt phone up',
-      };
+      return { aligned: false, reason: 'too_high', hint: 'Lower head or tilt phone up' };
     }
-
     if (this.smoothY > ALIGN_BOUNDS.maxY) {
-      return {
-        aligned: false,
-        reason: 'too_low',
-        hint: 'Raise posture or tilt phone down',
-      };
+      return { aligned: false, reason: 'too_low', hint: 'Raise posture or tilt phone down' };
     }
-
     if (this.motionSpeed > ALIGN_BOUNDS.maxSpeed) {
-      return {
-        aligned: false,
-        reason: 'moving',
-        hint: 'Hold steady to lock posture…',
-      };
+      return { aligned: false, reason: 'moving', hint: 'Hold steady to lock posture…' };
     }
-
-    return {
-      aligned: true,
-      reason: 'aligned',
-      hint: 'Aligned — locking neutral posture…',
-    };
+    return { aligned: true, reason: 'aligned', hint: 'Aligned — locking neutral posture…' };
   }
 
   update(nowMs, dtSec, viewW, viewH) {
@@ -497,23 +445,24 @@ export class PoseTracker {
       try {
         result = this.poseLandmarker.detectForVideo(video, ts);
       } catch (err) {
-        console.warn('[SWERVE] Pose detect frame skipped:', err);
+        console.warn('[ARCADE] Pose detect frame skipped:', err);
       }
 
       const rawLandmarks = result?.landmarks?.[0];
-      if (rawLandmarks && rawLandmarks.length >= 13) {
+      if (rawLandmarks && rawLandmarks.length >= 17) {
         this._processLandmarks(rawLandmarks, video.videoWidth, video.videoHeight, viewW, viewH, dtSec);
       } else {
         this.poseLostTimer += dtSec;
         if (this.poseLostTimer > 0.35) {
           this.hasPose = false;
           this.hasFullUpperBody = false;
+          this.hands.left.visible = false;
+          this.hands.right.visible = false;
           this.mappedLandmarks = null;
         }
       }
     }
 
-    // Wait until user is properly aligned and steady before advancing 1.4s calibration
     if (this.calibrating) {
       this.alignment = this._evaluateAlignment();
       if (this.alignment.aligned) {
@@ -529,7 +478,6 @@ export class PoseTracker {
           this._finalizeCalibration();
         }
       } else {
-        // Smoothly reset countdown until user aligns cleanly inside target zone
         this.calibrationElapsedMs = Math.max(0, this.calibrationElapsedMs - dtSec * 1000);
         if (this.calibrationElapsedMs === 0) {
           this.calibrationSamples = [];
@@ -538,6 +486,51 @@ export class PoseTracker {
     }
 
     return this.getState();
+  }
+
+  _updateHandState(handState, elbow, wrist, indexTip, dtSec, viewW, viewH) {
+    const hasW = wrist && wrist.visibility >= 0.32;
+    if (!hasW) {
+      handState.visible = false;
+      handState.speed *= 0.8;
+      return;
+    }
+
+    // Project fist/palm center slightly ahead of wrist toward index fingertip (or forearm vector)
+    let targetX = wrist.x;
+    let targetY = wrist.y;
+    if (indexTip && indexTip.visibility >= 0.3) {
+      targetX = wrist.x * 0.58 + indexTip.x * 0.42;
+      targetY = wrist.y * 0.58 + indexTip.y * 0.42;
+    } else if (elbow && elbow.visibility >= 0.32) {
+      targetX = wrist.x + (wrist.x - elbow.x) * 0.22;
+      targetY = wrist.y + (wrist.y - elbow.y) * 0.22;
+    }
+
+    const clampedX = clamp(targetX, 0, viewW);
+    const clampedY = clamp(targetY, 0, viewH);
+
+    if (!handState.visible) {
+      handState.x = clampedX;
+      handState.y = clampedY;
+      handState.vx = 0;
+      handState.vy = 0;
+      handState.speed = 0;
+    } else {
+      const a = emaAlpha(dtSec, 0.03); // Ultra-snappy tracking for fast punches
+      const prevX = handState.x;
+      const prevY = handState.y;
+      handState.x += (clampedX - handState.x) * a;
+      handState.y += (clampedY - handState.y) * a;
+      const dtSafe = Math.max(0.016, dtSec);
+      handState.vx = (handState.x - prevX) / dtSafe;
+      handState.vy = (handState.y - prevY) / dtSafe;
+      handState.speed = Math.hypot(handState.vx, handState.vy);
+    }
+
+    handState.nx = handState.x / viewW;
+    handState.ny = handState.y / viewH;
+    handState.visible = true;
   }
 
   _processLandmarks(rawLandmarks, vidW, vidH, viewW, viewH, dtSec) {
@@ -562,6 +555,8 @@ export class PoseTracker {
       if (this.poseLostTimer > 0.35) {
         this.hasPose = false;
         this.hasFullUpperBody = false;
+        this.hands.left.visible = false;
+        this.hands.right.visible = false;
         this.mappedLandmarks = null;
       }
       return;
@@ -627,7 +622,6 @@ export class PoseTracker {
     this.rawX = targetX;
     this.rawY = targetY;
 
-    // Frame-rate independent EMA smoothing + motion steadiness tracker
     if (!this.hasInitialSample) {
       this.smoothX = targetX;
       this.smoothY = targetY;
@@ -661,16 +655,21 @@ export class PoseTracker {
       y: this.smoothY * viewH,
     };
 
-    // Smooth shoulder tilt & normalized arm offsets (orientation-proof for front/back & mirror)
-    if (hasLS && hasRS && measuredSpanPx && measuredSpanPx > 16) {
-      const lsIsLeft = ls.x < rs.x;
-      const screenLeftSh = lsIsLeft ? ls : rs;
-      const screenRightSh = lsIsLeft ? rs : ls;
-      const leftElbow = lsIsLeft ? mapped[13] : mapped[14];
-      const leftWrist = lsIsLeft ? mapped[15] : mapped[16];
-      const rightElbow = lsIsLeft ? mapped[14] : mapped[13];
-      const rightWrist = lsIsLeft ? mapped[16] : mapped[15];
+    // Orientation-proof shoulder tilt, arm offsets, and live screen-left / screen-right hands
+    const lsIsLeft = hasLS && hasRS ? ls.x < rs.x : this.mirrored;
+    const screenLeftSh = lsIsLeft ? ls : rs;
+    const screenRightSh = lsIsLeft ? rs : ls;
+    const leftElbow = lsIsLeft ? mapped[13] : mapped[14];
+    const leftWrist = lsIsLeft ? mapped[15] : mapped[16];
+    const leftIndex = lsIsLeft ? mapped[19] : mapped[20];
+    const rightElbow = lsIsLeft ? mapped[14] : mapped[13];
+    const rightWrist = lsIsLeft ? mapped[16] : mapped[15];
+    const rightIndex = lsIsLeft ? mapped[20] : mapped[19];
 
+    this._updateHandState(this.hands.left, leftElbow, leftWrist, leftIndex, dtSec, viewW, viewH);
+    this._updateHandState(this.hands.right, rightElbow, rightWrist, rightIndex, dtSec, viewW, viewH);
+
+    if (hasLS && hasRS && measuredSpanPx && measuredSpanPx > 16) {
       const rawTilt = clamp(
         Math.atan2(screenRightSh.y - screenLeftSh.y, screenRightSh.x - screenLeftSh.x),
         -0.45,
@@ -707,7 +706,6 @@ export class PoseTracker {
       this.avatarArms = { left: null, right: null };
     }
 
-    // Evaluate duck state with hysteresis once calibrated
     if (this.calibrated) {
       const { enterDrop, exitDrop } = this.getDuckThresholdsNormH();
       const dropY = this.smoothY - this.neutralY;
@@ -778,6 +776,7 @@ export class PoseTracker {
       nosePx: this.nosePx,
       shoulderTilt: this.shoulderTilt,
       avatarArms: this.avatarArms,
+      hands: this.hands,
     };
   }
 }
