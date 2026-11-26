@@ -1,7 +1,7 @@
 // SWERVE — 3D Perspective Lean & Dodge engine, renderer, controls, and UI
 
-import { SoundEngine } from './audio.js';
-import { PoseTracker, UPPER_BODY_CONNECTIONS, ALIGN_BOUNDS } from './tracker.js';
+import { SoundEngine } from './audio.js?v=4';
+import { PoseTracker, UPPER_BODY_CONNECTIONS, ALIGN_BOUNDS } from './tracker.js?v=4';
 
 const STORAGE_KEYS = {
   highScore: 'swerve_high_score',
@@ -710,14 +710,14 @@ class SwerveGame {
 
   _getCorridorCamera() {
     const nearW = this.playW * 0.94;
-    const nearH = this.viewH * 0.72;
+    const nearH = this.viewH * 0.68;
     const cx = this.viewW * 0.5;
-    const cy = this.viewH * 0.54;
+    const cy = this.viewH * 0.49;
 
     // Slight elevated third-person 3D chase-cam with head-coupled lean & duck parallax
     const leanNorm = (this.player.x - 0.5) * 2; // -1..1
     const vpX = cx - leanNorm * (this.playW * 0.085);
-    const vpY = this.viewH * 0.42 + this.player.duckAnim * (this.viewH * 0.055);
+    const vpY = this.viewH * 0.38 + this.player.duckAnim * (this.viewH * 0.05);
 
     return { nearW, nearH, cx, cy, vpX, vpY };
   }
@@ -736,8 +736,8 @@ class SwerveGame {
     const pt = this._project(wx, wy, 0, cam);
     const floorPt = this._project(wx, 1.0, 0, cam);
 
-    // Compact, athletic runner height scaled cleanly to corridor height
-    const bodyH = clamp(cam.nearH * 0.255, 108, 154);
+    // Sleek, unmistakably readable athletic runner scaled cleanly to corridor height
+    const bodyH = clamp(cam.nearH * 0.27, 114, 162);
     const r = clamp(bodyH * 0.115, 12, 17);
     const hitHalfWx = clamp((bodyH * 0.145) / (cam.nearW * 0.5), 0.068, 0.105);
 
@@ -1948,24 +1948,27 @@ class SwerveGame {
 
     for (const leg of orderedLegs) {
       const isBack = leg.depth > 0.15 && duck < 0.5;
-      const fill = isBack ? '#101419' : '#1b222a';
-      const rim = isBack ? 'rgba(200, 245, 59, 0.28)' : 'rgba(200, 245, 59, 0.72)';
+      const fill = isBack ? '#98a6b3' : '#e8eef2';
+      const rim = '#0c0e10';
 
       this._drawLimb(ctx, leg.hip.x, leg.hip.y, leg.knee.x, leg.knee.y, thighW, fill, rim);
       this._drawLimb(ctx, leg.knee.x, leg.knee.y, leg.foot.x, leg.foot.y, shinW, fill, rim);
 
-      // Crisp sneaker accent
-      ctx.fillStyle = isBack ? '#89aa27' : COLORS.volt;
+      // Crisp volt sneaker accent
+      ctx.fillStyle = isBack ? '#9ec62c' : COLORS.volt;
+      ctx.strokeStyle = '#0c0e10';
+      ctx.lineWidth = 1.4;
       ctx.beginPath();
-      ctx.ellipse(leg.foot.x + leg.side * 2, leg.foot.y - 2, H * 0.055, H * 0.028, 0, 0, Math.PI * 2);
+      ctx.ellipse(leg.foot.x + leg.side * 2, leg.foot.y - 2, H * 0.058, H * 0.03, 0, 0, Math.PI * 2);
       ctx.fill();
+      ctx.stroke();
     }
 
-    // 4. Sculpted Athletic V-Tapered Torso
+    // 4. Sculpted Athletic V-Tapered Torso (high-contrast volt jersey with dark ink outline)
     ctx.save();
-    ctx.fillStyle = '#141920';
+    ctx.fillStyle = '#181e25';
     ctx.strokeStyle = COLORS.volt;
-    ctx.lineWidth = 1.8;
+    ctx.lineWidth = 2.4;
     ctx.lineJoin = 'round';
     ctx.beginPath();
     ctx.moveTo(shL.x, shL.y);
@@ -1976,22 +1979,22 @@ class SwerveGame {
     ctx.fill();
     ctx.stroke();
 
-    // High-contrast tennis-volt athletic spine chevron on back of jersey
-    const midChestX = lerp(shCenterX, hipX, 0.44);
-    const midChestY = lerp(shCenterY, hipY, 0.44);
+    // Bold tennis-volt chest/back V-chevron
+    const midChestX = lerp(shCenterX, hipX, 0.48);
+    const midChestY = lerp(shCenterY, hipY, 0.48);
     ctx.strokeStyle = COLORS.volt;
-    ctx.lineWidth = 2.4;
+    ctx.lineWidth = 3;
     ctx.lineCap = 'round';
     ctx.beginPath();
-    ctx.moveTo(lerp(shL.x, shCenterX, 0.35), lerp(shL.y, shCenterY, 0.35) + H * 0.06);
+    ctx.moveTo(lerp(shL.x, shCenterX, 0.25), lerp(shL.y, shCenterY, 0.25) + H * 0.05);
     ctx.lineTo(midChestX, midChestY + H * 0.05);
-    ctx.lineTo(lerp(shR.x, shCenterX, 0.35), lerp(shR.y, shCenterY, 0.35) + H * 0.06);
+    ctx.lineTo(lerp(shR.x, shCenterX, 0.25), lerp(shR.y, shCenterY, 0.25) + H * 0.05);
     ctx.stroke();
     ctx.restore();
 
     // 5. Articulated Arms (mirrored live from camera pose when visible, else dynamic sprint pump)
-    const armW = Math.max(4.5, H * 0.06);
-    const foreW = Math.max(3.8, H * 0.05);
+    const armW = Math.max(4.8, H * 0.062);
+    const foreW = Math.max(4, H * 0.052);
     const liveArms = this.controlMode === 'camera' && this.poseState.hasPose ? this.poseState.avatarArms : null;
     const armScale = shHalfW * 1.85;
 
@@ -2000,7 +2003,6 @@ class SwerveGame {
       let hand;
 
       if (liveVec) {
-        // Live camera pose mirrors your real arms with athletic proportion scaling
         elbow = {
           x: shoulder.x + liveVec.ex * armScale,
           y: shoulder.y + liveVec.ey * armScale,
@@ -2010,14 +2012,13 @@ class SwerveGame {
           y: shoulder.y + liveVec.wy * armScale,
         };
       } else {
-        // Kinetic running arm swing counter-phased with legs, sweeping outward when ducking
         const swing = Math.sin(stridePhase);
-        const runEx = shoulder.x + side * H * 0.085;
+        const runEx = shoulder.x + side * H * 0.088;
         const runEy = shoulder.y + H * (0.14 + swing * 0.035);
-        const runHx = runEx + side * H * 0.03;
+        const runHx = runEx + side * H * 0.032;
         const runHy = runEy + H * (0.12 - swing * 0.05);
 
-        const duckEx = shoulder.x + side * H * 0.145;
+        const duckEx = shoulder.x + side * H * 0.15;
         const duckEy = shoulder.y + H * 0.085;
         const duckHx = duckEx + side * H * 0.085;
         const duckHy = duckEy + H * 0.065;
@@ -2026,14 +2027,17 @@ class SwerveGame {
         hand = { x: lerp(runHx, duckHx, duck), y: lerp(runHy, duckHy, duck) };
       }
 
-      this._drawLimb(ctx, shoulder.x, shoulder.y, elbow.x, elbow.y, armW, '#1b222a', 'rgba(200, 245, 59, 0.72)');
-      this._drawLimb(ctx, elbow.x, elbow.y, hand.x, hand.y, foreW, '#1b222a', 'rgba(200, 245, 59, 0.65)');
+      this._drawLimb(ctx, shoulder.x, shoulder.y, elbow.x, elbow.y, armW, '#e8eef2', '#0c0e10');
+      this._drawLimb(ctx, elbow.x, elbow.y, hand.x, hand.y, foreW, '#d6e0e8', '#0c0e10');
 
-      // Crisp volt wrist/glove accent
+      // Crisp volt glove accent
       ctx.fillStyle = COLORS.volt;
+      ctx.strokeStyle = '#0c0e10';
+      ctx.lineWidth = 1.2;
       ctx.beginPath();
-      ctx.arc(hand.x, hand.y, Math.max(2.6, H * 0.028), 0, Math.PI * 2);
+      ctx.arc(hand.x, hand.y, Math.max(3, H * 0.032), 0, Math.PI * 2);
       ctx.fill();
+      ctx.stroke();
     };
 
     drawArm(-1, shL, phase + Math.PI, liveArms?.left || null);
